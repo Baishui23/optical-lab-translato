@@ -23,7 +23,7 @@ client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
 
-# --- 1. CSS 样式 (V29: 优化双栏对齐和宽度) ---
+# --- 1. CSS 样式 (V30: 表格布局 + 原文美化) ---
 COMMON_CSS = """
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&family=Times+New+Roman&display=swap');
@@ -32,67 +32,79 @@ COMMON_CSS = """
         font-family: "Noto Serif SC", "SimSun", serif;
         font-size: 15px; 
         line-height: 1.6;
-        color: #000;
+        color: #111;
         margin: 0;
         padding: 0;
         background-color: white;
     }
 
     .page-container {
-        max-width: 95%; /* V29: 加宽页面，给双栏更多空间 */
+        max-width: 95%; 
         margin: 0 auto;
         padding: 30px;
         background-color: #fff;
     }
 
-    /* === 纯净模式样式 === */
-    .pure-text p { margin-bottom: 1em; text-indent: 2em; text-align: justify; }
-
-    /* === 对照模式样式 (V29: 表格布局实现严格对齐) === */
+    /* === 双栏对照表格 (核心) === */
     .bilingual-table {
         width: 100%;
         border-collapse: collapse;
-        margin-bottom: 1em;
-        table-layout: fixed; /* 强制等宽 */
+        margin-bottom: 20px;
+        table-layout: fixed; /* 强制等宽，防止挤压 */
     }
     
     .bilingual-row {
-        vertical-align: top; /* 顶部对齐 */
-        border-bottom: 1px dashed #f0f0f0; /* 段落间虚线 */
+        vertical-align: top;
+        border-bottom: 1px dashed #e0e0e0; /* 每段之间加虚线，清晰 */
     }
     
+    .bilingual-row:last-child {
+        border-bottom: none;
+    }
+
+    /* 左侧：原文列 */
     .col-eng {
         width: 48%;
-        padding: 10px 15px 10px 0;
-        color: #444; 
+        padding: 12px 15px 12px 0;
+        color: #333; 
         font-family: "Times New Roman", serif;
-        text-align: justify;
-        font-size: 14px;
-        border-right: 2px solid #eee; 
-        word-wrap: break-word; /* 防止长公式撑爆 */
+        text-align: justify; /* 两端对齐，解决“排版烂” */
+        font-size: 15px;
+        line-height: 1.5;
+        border-right: 2px solid #f0f0f0; 
+        word-wrap: break-word;
+        hyphens: auto; /* 英文自动断词 */
     }
     
+    /* 右侧：译文列 */
     .col-chn {
         width: 48%;
-        padding: 10px 0 10px 15px;
+        padding: 12px 0 12px 15px;
         color: #000; 
+        font-family: "Noto Serif SC", serif;
         text-align: justify;
+        font-size: 15px;
+        line-height: 1.6;
         word-wrap: break-word;
     }
 
-    /* 图片统一样式 */
+    /* 纯净模式 */
+    .pure-text p { margin-bottom: 1em; text-indent: 2em; text-align: justify; }
+
+    /* 图片 */
     img { max-width: 90%; display: block; margin: 15px auto; }
     
     .caption { 
-        font-size: 13px; color: #444; text-align: center; 
+        font-size: 13px; color: #555; text-align: center; 
         font-weight: bold; margin-bottom: 25px; font-family: sans-serif;
+        background: #f9f9f9; padding: 5px; border-radius: 4px;
     }
 
-    /* 分页控制 */
+    /* 分页 */
     .page-break { 
-        page-break-before: always; border-top: 1px dashed #ccc; 
+        page-break-before: always; border-top: 2px solid #eee; 
         margin-top: 20px; padding-top: 10px; text-align: center; 
-        color: #999; font-size: 12px; 
+        color: #ccc; font-size: 12px; 
     }
     .page-break.first-page { page-break-before: avoid; display: none; }
     
@@ -109,7 +121,70 @@ MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache:
 <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 """
 
-# --- 2. 核心逻辑 ---
+# --- 2. 核心逻辑 (V30: 积木式对齐 + 强力清洗) ---
+
+def clean_pdf_text(text):
+    """
+    V30关键函数：清洗PDF的烂排版
+    1. 去除行尾连字符 (pro-\ngram -> program)
+    2. 去除硬换行，变成流畅段落
+    """
+    # 替换连字符换行: "word-\nnext" -> "wordnext"
+    text = text.replace('-\n', '')
+    # 替换普通换行: "word\nnext" -> "word next"
+    text = text.replace('\n', ' ')
+    # 去除多余空格
+    return re.sub(r'\s+', ' ', text).strip()
+
+def translate_batch(text_list, is_caption=False):
+    """
+    批量翻译列表，保持一一对应
+    """
+    if not text_list: return []
+    
+    # 构造带分隔符的 Prompt，强迫模型保持结构
+    separator = " ||| "
+    combined_text = separator.join(text_list)
+    
+    sys_prompt = """你是一个物理学术翻译。
+    【指令】
+    1. 翻译给定的文本片段。
+    2. 输入中有 ' ||| ' 分隔符，输出中必须保留该分隔符，严格一一对应。
+    3. 保持公式格式 $...$ 不变。
+    4. 不要合并段落，不要自由发挥。
+    """
+    if is_caption: sys_prompt += " (这是图注)"
+    
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": combined_text}],
+            stream=False
+        )
+        result = response.choices[0].message.content
+        # 按分隔符拆回列表
+        trans_list = result.split("|||")
+        
+        # 兜底：如果拆分数量不对，强制补齐或截断
+        if len(trans_list) != len(text_list):
+            # 如果AI没听话，就回退到逐个翻译（稍微慢点但稳）
+            return [translate_single(t) for t in text_list]
+            
+        return [t.strip() for t in trans_list]
+    except:
+        return text_list # 失败返回原文
+
+def translate_single(text):
+    # 备用单条翻译
+    try:
+        res = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "system", "content": "翻译为学术中文，保留LaTeX公式"}, {"role": "user", "content": text}],
+            stream=False
+        )
+        return res.choices[0].message.content
+    except: return text
+
 def image_to_base64(pil_image):
     buff = io.BytesIO()
     pil_image.save(buff, format="PNG")
@@ -125,25 +200,6 @@ def is_caption_node(text):
     text = text.strip()
     return text.startswith("Fig.") or (text.startswith("Figure") and re.match(r'^Figure\s?\d+[.:]', text))
 
-def translate_text(text, is_caption=False):
-    if len(text.strip()) < 2: return text
-    # V29 Prompt优化：强制AI不要合并段落，方便后续拆分
-    sys_prompt = """你是一个专业的物理学术翻译。请将文本翻译成流畅的学术中文。
-    【重要规则】
-    1. 保持原文的段落结构，原文有几段，译文就输出几段。
-    2. 公式保持原样，使用 $...$ 或 $$...$$ 包裹。
-    3. 不要输出任何闲聊内容。
-    """
-    if is_caption: sys_prompt += " (这是图注，保留编号)"
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": text}],
-            stream=False
-        )
-        return response.choices[0].message.content
-    except: return text
-
 def capture_image_between_blocks(page, prev_bottom, current_top):
     if current_top - prev_bottom < 40: return None
     rect = fitz.Rect(50, prev_bottom + 5, page.rect.width - 50, current_top - 5)
@@ -155,40 +211,66 @@ def capture_image_between_blocks(page, prev_bottom, current_top):
 
 def parse_page(page):
     elements = []
-    blocks = page.get_text("blocks", sort=True)
+    blocks = page.get_text("blocks", sort=True) # 按位置排序
     last_bottom = 0
-    text_buffer = ""
+    
+    # 临时收集器
     valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page.rect.height)]
+    
+    # 1. 预处理：将所有Block分类 (图片/图注/正文)
+    text_buffer_list = [] # 待翻译的纯文本块
     
     for i, b in enumerate(valid_blocks):
         b_rect = fitz.Rect(b[:4])
         b_top = b_rect.y0
         if i == 0 and last_bottom == 0: last_bottom = b_top
+        
+        raw_text = b[4]
+        
+        # 检查是否是图注
+        if is_caption_node(raw_text):
+            # 先处理之前积攒的文本
+            if text_buffer_list:
+                # 批量翻译之前攒的积木
+                cleaned_texts = [clean_pdf_text(t) for t in text_buffer_list]
+                trans_texts = translate_batch(cleaned_texts)
+                # 存入elements
+                for src, trans in zip(cleaned_texts, trans_texts):
+                    if src.strip():
+                        elements.append({'type': 'text_pair', 'original': src, 'translation': trans})
+                text_buffer_list = []
 
-        if is_caption_node(b[4]):
-            if text_buffer.strip():
-                trans = translate_text(text_buffer)
-                elements.append({'type': 'text', 'original': text_buffer, 'translation': trans})
-                text_buffer = ""
-            
+            # 抓取图注上方的图片
             img = capture_image_between_blocks(page, last_bottom, b_top)
             if img: elements.append({'type': 'image', 'content': img})
             
-            caption_trans = translate_text(b[4], True)
-            elements.append({'type': 'caption', 'original': b[4], 'translation': caption_trans})
+            # 处理图注本身
+            clean_cap = clean_pdf_text(raw_text)
+            trans_cap = translate_single(clean_cap)
+            elements.append({'type': 'caption', 'original': clean_cap, 'translation': trans_cap})
+            
         else:
-            text_buffer += b[4] + "\n\n"
+            # 普通文本，先清洗，如果太短（可能是页码噪音）就丢弃
+            cleaned = clean_pdf_text(raw_text)
+            if len(cleaned) > 5: # 忽略太碎的噪点
+                text_buffer_list.append(raw_text) # 暂存，稍后批量翻译
+            
         last_bottom = b_rect.y1
         
-    if text_buffer.strip():
-        trans = translate_text(text_buffer)
-        elements.append({'type': 'text', 'original': text_buffer, 'translation': trans})
+    # 2. 处理页面剩余的文本
+    if text_buffer_list:
+        cleaned_texts = [clean_pdf_text(t) for t in text_buffer_list]
+        trans_texts = translate_batch(cleaned_texts)
+        for src, trans in zip(cleaned_texts, trans_texts):
+            if src.strip():
+                elements.append({'type': 'text_pair', 'original': src, 'translation': trans})
+                
     return elements
 
 def clean_latex(text):
     return text.replace(r'\[', '$$').replace(r'\]', '$$').replace(r'\(', '$').replace(r'\)', '$')
 
-# --- 3. HTML 构建器 (V29: 智能段落对齐逻辑) ---
+# --- 3. HTML 构建器 (V30: 严格表格行生成) ---
 def generate_html(all_pages_data, mode="pure", filename="Doc"):
     html_body = f'<div class="page-container">'
     
@@ -196,57 +278,45 @@ def generate_html(all_pages_data, mode="pure", filename="Doc"):
         page_class = "page-break first-page" if idx == 0 else "page-break"
         html_body += f'<div class="{page_class}">- {idx+1} -</div>'
         
+        # 如果是对照模式，开启大表格
+        if mode == "bilingual":
+            html_body += '<table class="bilingual-table">'
+        
         for el in page_els:
             if el['type'] == 'image':
+                # 图片暂时打断表格（如果表格已开启，先闭合，放图，再开）
+                if mode == "bilingual": html_body += '</table>'
                 html_body += f'<img src="{image_to_base64(el["content"])}" />'
+                if mode == "bilingual": html_body += '<table class="bilingual-table">'
             
             elif el['type'] == 'caption':
+                if mode == "bilingual": html_body += '</table>' # 打断表格
+                html_body += f"""
+                <div class="caption">
+                    <div>[原文] {el['original']}</div>
+                    <div style="margin-top:4px; color:#000;">[译文] {el['translation']}</div>
+                </div>
+                """
+                if mode == "bilingual": html_body += '<table class="bilingual-table">'
+                
+            elif el['type'] == 'text_pair':
                 if mode == "bilingual":
+                    # --- V30: 完美的表格行 ---
+                    op = el['original']
+                    tp = clean_latex(el['translation'])
                     html_body += f"""
-                    <div class="caption">
-                        <div style="margin-bottom:5px; color:#666; font-weight:normal;">{el['original']}</div>
-                        <div>{el['translation']}</div>
-                    </div>
+                    <tr class="bilingual-row">
+                        <td class="col-eng">{op}</td>
+                        <td class="col-chn">{tp}</td>
+                    </tr>
                     """
                 else:
-                    html_body += f'<div class="caption">{el["translation"]}</div>'
-            
-            elif el['type'] == 'text':
-                if mode == "bilingual":
-                    # --- V29 核心升级：拆分段落进行对齐 ---
-                    # 1. 清洗并拆分原文段落
-                    orig_paras = [p for p in el['original'].split('\n\n') if p.strip()]
-                    # 2. 清洗并拆分译文段落
-                    trans_text = clean_latex(el['translation'])
-                    trans_paras = [p for p in trans_text.split('\n\n') if p.strip()]
-                    
-                    # 3. 使用表格布局，一行行对齐
-                    html_body += '<table class="bilingual-table">'
-                    
-                    # 取最大段落数，防止越界
-                    max_len = max(len(orig_paras), len(trans_paras))
-                    for i in range(max_len):
-                        op = orig_paras[i] if i < len(orig_paras) else ""
-                        tp = trans_paras[i] if i < len(trans_paras) else ""
-                        
-                        # 清洗 LaTeX 和换行
-                        op = clean_latex(op).replace('\n', ' ')
-                        
-                        if op or tp:
-                            html_body += f"""
-                            <tr class="bilingual-row">
-                                <td class="col-eng">{op}</td>
-                                <td class="col-chn">{tp}</td>
-                            </tr>
-                            """
-                    html_body += '</table>'
-                else:
                     # 纯净模式
-                    paras = clean_latex(el['translation']).split('\n\n')
-                    html_body += '<div class="pure-text">'
-                    for p in paras:
-                        if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
-                    html_body += '</div>'
+                    tp = clean_latex(el['translation'])
+                    html_body += f'<div class="pure-text"><p>{tp}</p></div>'
+
+        if mode == "bilingual":
+            html_body += '</table>' # 闭合本页表格
 
     html_body += "</div>"
     return f"<!DOCTYPE html><html><head><meta charset='utf-8'>{COMMON_CSS}{MATHJAX_SCRIPT}</head><body>{html_body}</body></html>"
@@ -276,7 +346,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         chrome_bin, "--headless", "--disable-gpu", 
         f"--print-to-pdf={output_pdf_path}",
         "--no-pdf-header-footer", 
-        "--virtual-time-budget=10000", # V29: 增加渲染等待时间，防止公式加载不全
+        "--virtual-time-budget=10000",
         f"file://{tmp_html_path}"
     ]
     if platform.system() == "Linux": cmd.insert(1, "--no-sandbox")
@@ -309,9 +379,9 @@ with st.sidebar:
     if app_mode == "🖨️ 导出 PDF":
         st.markdown("##### 📄 导出格式")
         export_style = st.radio(
-            "选择排版风格：",
-            ["纯净译文版 (仅中文)", "中英对照版 (智能对齐)"], # V29
-            index=0
+            "排版风格：",
+            ["纯净译文版 (仅中文)", "中英对照版 (严格对齐)"], 
+            index=1 # 默认选中对照版
         )
 
 if uploaded_file:
@@ -333,9 +403,9 @@ if uploaded_file:
         with c2:
             st.subheader("译文预览")
             if st.session_state.get('run_preview'):
-                with st.spinner("AI 解析中..."):
+                with st.spinner("AI 正在积木式解析..."):
                     els = parse_page(doc[page_num-1])
-                    preview_html = generate_html([els], mode="pure")
+                    preview_html = generate_html([els], mode="bilingual") # 预览也直接看对照效果
                     components.html(preview_html, height=800, scrolling=True)
 
     else:
@@ -352,19 +422,19 @@ if uploaded_file:
             status = st.empty()
             
             for i, p in enumerate(range(start, end + 1)):
-                status.text(f"正在处理第 {p} 页...")
+                status.text(f"正在处理第 {p} 页 (精准对齐中)...")
                 data.append(parse_page(doc[p-1]))
                 bar.progress((i+1) / (end-start+1))
             
-            status.text("正在智能排版...")
+            status.text("正在渲染文档...")
             full_html = generate_html(data, mode=style_code, filename=uploaded_file.name)
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
                 ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
                 if ok:
                     status.success("✅ 完成！")
-                    fname = "Translation_Bilingual.pdf" if style_code == "bilingual" else "Translation_Pure.pdf"
+                    fname = "Translation_Aligned.pdf" if style_code == "bilingual" else "Translation_Pure.pdf"
                     with open(tmp_pdf.name, "rb") as f:
-                        st.download_button("📥 下载 PDF 文件", f, fname)
+                        st.download_button("📥 下载完美对齐版 PDF", f, fname)
                 else:
                     st.error(f"失败: {msg}")
