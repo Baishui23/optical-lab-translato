@@ -175,36 +175,58 @@ def batch_translate_elements(elements):
         elements[idx_in_elements]['content'] = results[idx_in_tasks]
     return elements
 
+# --- 修正函数 1：降低截图门槛，防止漏图 ---
 def capture_image_between_blocks(page, prev_bottom, current_top):
-    if current_top - prev_bottom < 40: return None
-    rect = fitz.Rect(50, prev_bottom + 5, page.rect.width - 50, current_top - 5)
+    # ⬇️ 改动点：将 40 改为 10。论文排版很紧凑，间隙往往很小。
+    if current_top - prev_bottom < 10: return None 
+    
+    # ⬇️ 改动点：左右边距放宽 (50 -> 40)，上下边距收紧 (+2) 防止截到文字
+    rect = fitz.Rect(40, prev_bottom + 2, page.rect.width - 40, current_top - 2)
+    
     try:
-        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=rect, alpha=False)
+        # 提高分辨率 matrix=3 -> 4，让公式图更清晰
+        pix = page.get_pixmap(matrix=fitz.Matrix(4, 4), clip=rect, alpha=False)
+        
+        # ⬇️ 改动点：只要高度超过 10px 就认为是有效图片 (防止线条被过滤)
+        if pix.height < 10 or pix.width < 10: return None
+        
         img = Image.open(io.BytesIO(pix.tobytes("png")))
-        return img if img.size[1] >= 20 else None
-    except: return None
+        return img
+    except: 
+        return None
 
+# --- 修正函数 2：修复页面顶部图片丢失的 BUG ---
 def parse_page(page):
     raw_elements = []
     blocks = page.get_text("blocks", sort=True)
-    last_bottom = 0
+    
+    # ⬇️ 改动点：默认起始高度设为 60 (避开页眉)，而不是 0
+    # 这样如果图片在第一段文字上面，也能被截取到
+    last_bottom = 60 
+    
     text_buffer = ""
     valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page.rect.height)]
     
     for i, b in enumerate(valid_blocks):
         b_rect = fitz.Rect(b[:4])
         b_top = b_rect.y0
-        if i == 0 and last_bottom == 0: last_bottom = b_top
+        
+        # ❌ 删除这一行！它会导致第一段文字上方的图片无法被计算
+        # if i == 0 and last_bottom == 0: last_bottom = b_top 
 
         if is_caption_node(b[4]):
             if text_buffer.strip():
                 raw_elements.append({'type': 'text', 'content': text_buffer})
                 text_buffer = ""
+            
+            # 尝试捕获图片
             img = capture_image_between_blocks(page, last_bottom, b_top)
             if img: raw_elements.append({'type': 'image', 'content': img})
+            
             raw_elements.append({'type': 'caption', 'content': b[4]})
         else:
             text_buffer += b[4] + "\n\n"
+        
         last_bottom = b_rect.y1
         
     if text_buffer.strip():
