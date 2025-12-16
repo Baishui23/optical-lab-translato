@@ -16,21 +16,21 @@ import streamlit.components.v1 as components
 try:
     API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 except:
-    API_KEY = "sk-xxxxxxxxxxxx" # 本地测试请填入真实Key
+    API_KEY = "sk-xxxxxxxx" # 本地测试请填入真实Key
 
 BASE_URL = "https://api.deepseek.com"
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
 
-# --- 1. CSS 样式 (新增双栏对照样式) ---
+# --- 1. CSS 样式 (V29: 优化双栏对齐和宽度) ---
 COMMON_CSS = """
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&family=Times+New+Roman&display=swap');
 
     body {
         font-family: "Noto Serif SC", "SimSun", serif;
-        font-size: 15px; /* 稍微调小一点以适应双栏 */
+        font-size: 15px; 
         line-height: 1.6;
         color: #000;
         margin: 0;
@@ -39,43 +39,49 @@ COMMON_CSS = """
     }
 
     .page-container {
-        max-width: 900px; /* 变宽一点容纳双栏 */
+        max-width: 95%; /* V29: 加宽页面，给双栏更多空间 */
         margin: 0 auto;
-        padding: 40px;
+        padding: 30px;
         background-color: #fff;
     }
 
     /* === 纯净模式样式 === */
     .pure-text p { margin-bottom: 1em; text-indent: 2em; text-align: justify; }
 
-    /* === 对照模式样式 (关键新增) === */
+    /* === 对照模式样式 (V29: 表格布局实现严格对齐) === */
+    .bilingual-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 1em;
+        table-layout: fixed; /* 强制等宽 */
+    }
+    
     .bilingual-row {
-        display: flex;
-        flex-direction: row;
-        margin-bottom: 1.5em;
-        border-bottom: 1px solid #f0f0f0; /* 段落间加个淡线 */
-        padding-bottom: 1em;
+        vertical-align: top; /* 顶部对齐 */
+        border-bottom: 1px dashed #f0f0f0; /* 段落间虚线 */
     }
     
     .col-eng {
-        flex: 1;
-        padding-right: 20px;
-        color: #555; /* 原文灰色，不抢眼 */
+        width: 48%;
+        padding: 10px 15px 10px 0;
+        color: #444; 
         font-family: "Times New Roman", serif;
         text-align: justify;
         font-size: 14px;
-        border-right: 2px solid #eee; /* 中间加个分隔线 */
+        border-right: 2px solid #eee; 
+        word-wrap: break-word; /* 防止长公式撑爆 */
     }
     
     .col-chn {
-        flex: 1;
-        padding-left: 20px;
-        color: #000; /* 译文黑色，重点突出 */
+        width: 48%;
+        padding: 10px 0 10px 15px;
+        color: #000; 
         text-align: justify;
+        word-wrap: break-word;
     }
 
     /* 图片统一样式 */
-    img { max-width: 95%; display: block; margin: 20px auto; }
+    img { max-width: 90%; display: block; margin: 15px auto; }
     
     .caption { 
         font-size: 13px; color: #444; text-align: center; 
@@ -85,7 +91,7 @@ COMMON_CSS = """
     /* 分页控制 */
     .page-break { 
         page-break-before: always; border-top: 1px dashed #ccc; 
-        margin-top: 30px; padding-top: 10px; text-align: center; 
+        margin-top: 20px; padding-top: 10px; text-align: center; 
         color: #999; font-size: 12px; 
     }
     .page-break.first-page { page-break-before: avoid; display: none; }
@@ -103,7 +109,7 @@ MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache:
 <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 """
 
-# --- 2. 核心逻辑 (升级：同时保留原文和译文) ---
+# --- 2. 核心逻辑 ---
 def image_to_base64(pil_image):
     buff = io.BytesIO()
     pil_image.save(buff, format="PNG")
@@ -121,13 +127,14 @@ def is_caption_node(text):
 
 def translate_text(text, is_caption=False):
     if len(text.strip()) < 2: return text
+    # V29 Prompt优化：强制AI不要合并段落，方便后续拆分
     sys_prompt = """你是一个专业的物理学术翻译。请将文本翻译成流畅的学术中文。
-    【规则】
-    1. 保持学术严谨性。
-    2. 公式必须用 $...$ 或 $$...$$ 包裹。
-    3. 直接输出译文，不要加任何前缀。
+    【重要规则】
+    1. 保持原文的段落结构，原文有几段，译文就输出几段。
+    2. 公式保持原样，使用 $...$ 或 $$...$$ 包裹。
+    3. 不要输出任何闲聊内容。
     """
-    if is_caption: sys_prompt += " (这是图注，请保留 Figure 编号)"
+    if is_caption: sys_prompt += " (这是图注，保留编号)"
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
@@ -146,7 +153,6 @@ def capture_image_between_blocks(page, prev_bottom, current_top):
         return img if img.size[1] >= 20 else None
     except: return None
 
-# V28 修改：parse_page 现在同时保存 original 和 translation
 def parse_page(page):
     elements = []
     blocks = page.get_text("blocks", sort=True)
@@ -160,17 +166,14 @@ def parse_page(page):
         if i == 0 and last_bottom == 0: last_bottom = b_top
 
         if is_caption_node(b[4]):
-            # 处理之前的文本块
             if text_buffer.strip():
                 trans = translate_text(text_buffer)
                 elements.append({'type': 'text', 'original': text_buffer, 'translation': trans})
                 text_buffer = ""
             
-            # 处理图片
             img = capture_image_between_blocks(page, last_bottom, b_top)
             if img: elements.append({'type': 'image', 'content': img})
             
-            # 处理图注
             caption_trans = translate_text(b[4], True)
             elements.append({'type': 'caption', 'original': b[4], 'translation': caption_trans})
         else:
@@ -185,7 +188,7 @@ def parse_page(page):
 def clean_latex(text):
     return text.replace(r'\[', '$$').replace(r'\]', '$$').replace(r'\(', '$').replace(r'\)', '$')
 
-# --- 3. HTML 构建器 (双模式逻辑) ---
+# --- 3. HTML 构建器 (V29: 智能段落对齐逻辑) ---
 def generate_html(all_pages_data, mode="pure", filename="Doc"):
     html_body = f'<div class="page-container">'
     
@@ -195,36 +198,50 @@ def generate_html(all_pages_data, mode="pure", filename="Doc"):
         
         for el in page_els:
             if el['type'] == 'image':
-                # 图片始终居中显示
                 html_body += f'<img src="{image_to_base64(el["content"])}" />'
             
             elif el['type'] == 'caption':
-                # 图注
                 if mode == "bilingual":
                     html_body += f"""
                     <div class="caption">
-                        <span style="color:#666; font-size:0.9em;">[原文] {el['original']}</span><br>
-                        <span>{el['translation']}</span>
+                        <div style="margin-bottom:5px; color:#666; font-weight:normal;">{el['original']}</div>
+                        <div>{el['translation']}</div>
                     </div>
                     """
                 else:
                     html_body += f'<div class="caption">{el["translation"]}</div>'
             
             elif el['type'] == 'text':
-                # 正文
                 if mode == "bilingual":
-                    # --- 双栏对照布局 ---
-                    orig = clean_latex(el['original']).replace('\n', '<br>')
-                    trans = clean_latex(el['translation']).replace('\n\n', '</p><p>')
+                    # --- V29 核心升级：拆分段落进行对齐 ---
+                    # 1. 清洗并拆分原文段落
+                    orig_paras = [p for p in el['original'].split('\n\n') if p.strip()]
+                    # 2. 清洗并拆分译文段落
+                    trans_text = clean_latex(el['translation'])
+                    trans_paras = [p for p in trans_text.split('\n\n') if p.strip()]
                     
-                    html_body += f"""
-                    <div class="bilingual-row">
-                        <div class="col-eng">{orig}</div>
-                        <div class="col-chn"><p>{trans}</p></div>
-                    </div>
-                    """
+                    # 3. 使用表格布局，一行行对齐
+                    html_body += '<table class="bilingual-table">'
+                    
+                    # 取最大段落数，防止越界
+                    max_len = max(len(orig_paras), len(trans_paras))
+                    for i in range(max_len):
+                        op = orig_paras[i] if i < len(orig_paras) else ""
+                        tp = trans_paras[i] if i < len(trans_paras) else ""
+                        
+                        # 清洗 LaTeX 和换行
+                        op = clean_latex(op).replace('\n', ' ')
+                        
+                        if op or tp:
+                            html_body += f"""
+                            <tr class="bilingual-row">
+                                <td class="col-eng">{op}</td>
+                                <td class="col-chn">{tp}</td>
+                            </tr>
+                            """
+                    html_body += '</table>'
                 else:
-                    # --- 纯净翻译布局 ---
+                    # 纯净模式
                     paras = clean_latex(el['translation']).split('\n\n')
                     html_body += '<div class="pure-text">'
                     for p in paras:
@@ -249,7 +266,7 @@ def get_chrome_path():
 def html_to_pdf_with_chrome(html_content, output_pdf_path):
     chrome_bin = get_chrome_path()
     if not chrome_bin:
-        return False, "❌ 未找到浏览器核心，请检查 packages.txt"
+        return False, "❌ 未找到浏览器核心"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as tmp_html:
         tmp_html.write(html_content)
@@ -259,7 +276,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         chrome_bin, "--headless", "--disable-gpu", 
         f"--print-to-pdf={output_pdf_path}",
         "--no-pdf-header-footer", 
-        "--virtual-time-budget=8000",
+        "--virtual-time-budget=10000", # V29: 增加渲染等待时间，防止公式加载不全
         f"file://{tmp_html_path}"
     ]
     if platform.system() == "Linux": cmd.insert(1, "--no-sandbox")
@@ -287,15 +304,13 @@ with st.sidebar:
     uploaded_file = st.file_uploader("上传 PDF", type="pdf")
     st.markdown("---")
     
-    # 模式选择
     app_mode = st.radio("功能模式", ["👁️ 实时预览", "🖨️ 导出 PDF"])
     
-    # 新增：导出格式选择
     if app_mode == "🖨️ 导出 PDF":
         st.markdown("##### 📄 导出格式")
         export_style = st.radio(
             "选择排版风格：",
-            ["纯净译文版 (仅中文)", "中英对照版 (左英右中)"],
+            ["纯净译文版 (仅中文)", "中英对照版 (智能对齐)"], # V29
             index=0
         )
 
@@ -320,17 +335,15 @@ if uploaded_file:
             if st.session_state.get('run_preview'):
                 with st.spinner("AI 解析中..."):
                     els = parse_page(doc[page_num-1])
-                    # 预览强制使用纯净版，因为左边已经有原文图片了
                     preview_html = generate_html([els], mode="pure")
                     components.html(preview_html, height=800, scrolling=True)
 
-    else: # 导出模式
+    else:
         st.subheader("📄 批量导出")
         c1, c2 = st.columns(2)
         with c1: start = st.number_input("起始页", 1, len(doc), 1)
         with c2: end = st.number_input("结束页", 1, len(doc), min(3, len(doc)))
         
-        # 映射用户选择到代码逻辑
         style_code = "bilingual" if "对照" in export_style else "pure"
         
         if st.button(f"🚀 生成 PDF ({export_style})", type="primary"):
@@ -343,7 +356,7 @@ if uploaded_file:
                 data.append(parse_page(doc[p-1]))
                 bar.progress((i+1) / (end-start+1))
             
-            status.text("正在排版...")
+            status.text("正在智能排版...")
             full_html = generate_html(data, mode=style_code, filename=uploaded_file.name)
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
