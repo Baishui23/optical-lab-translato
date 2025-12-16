@@ -139,14 +139,12 @@ def get_next_client():
 def pre_clean_text(text: str) -> str:
     """在发送给 LLM 之前，强力清理 PDF 提取的垃圾字符画，避免 LLM 混淆。"""
     
-    # 移除常见的 PDF 提取的破碎符号：
-    text = text.replace('/|', ' ')  # 移除 /| 可能是矩阵/矢量的左括号
-    text = text.replace('|\\', ' ') # 移除 |\\ 可能是矩阵/矢量的右括号
-    text = text.replace('\\/', ' ') # 移除 \/
-    text = text.replace('\\', ' ')  # 移除多余的反斜杠
-    text = text.replace('  ', ' ')  # 合并多余空格
+    text = text.replace('/|', ' ')
+    text = text.replace('|\\', ' ')
+    text = text.replace('\\/', ' ')
+    text = text.replace('\\', ' ')
+    text = text.replace('  ', ' ')
     
-    # 移除被破碎的公式编号 (e.g., / (1) /)
     text = re.sub(r'\s*\(\d\)\s*/', ' ', text)
     text = re.sub(r'/\s*\(\d\)\s*', ' ', text)
     
@@ -155,33 +153,35 @@ def pre_clean_text(text: str) -> str:
     
     return text.strip()
 
+# === V51 修复：将 sys_prompt 定义为常量，避免 f-string 风险 ===
+_SYS_PROMPT_BASE = r"""你是一位精通光学和量子物理的学术翻译专家。
+【任务】
+1. 将用户提供的英文学术文本翻译成**流畅、准确的简体中文**。
+2. **核心修复**：你收到的文本可能已经被我进行了初步的清理（例如移除了破碎符号）。但如果文本中仍然存在破碎的数学公式结构（例如琼斯矩阵/矢量，其中可能包含 '[VERTICAL_SPLIT]' 标记），你**必须**根据上下文将其还原为标准的 LaTeX 格式（使用 `$$...$$` 或 `$...$`）。
+   - 例子：看到 'E_in = 1 [VERTICAL_SPLIT] 0 (1)'，请输出 '入射琼斯矢量表示为：$$ E_{in} = \begin{pmatrix} 1 \\ 0 \end{pmatrix} \quad (1) $$'
+3. **绝对禁止**直接输出英文原文。必须翻译！
+4. 不要输出任何解释性文字，只输出翻译后的正文。
+"""
+
+_SYS_PROMPT_CAPTION = r""" (注意：这是图片说明，请保留 Figure 编号，例如 '图1(a) 展示了...') """
+
 # === V50 核心功能：带重试的翻译函数 ===
 def translate_text(text: str, is_caption: bool, max_retries: int = 3) -> str:
     if len(text.strip()) < 2: return text
     
-    # V50 关键：先进行文本预清洗
     cleaned_text = pre_clean_text(text)
     
-    # 降低温度，让模型更“保守”和“稳定”地进行修复
     temperature = 0.1 
     
-    sys_prompt = f"""你是一位精通光学和量子物理的学术翻译专家。
-    【任务】
-    1. 将用户提供的英文学术文本翻译成**流畅、准确的简体中文**。
-    2. **核心修复**：你收到的文本可能已经被我进行了初步的清理（例如移除了破碎符号）。但如果文本中仍然存在破碎的数学公式结构（例如琼斯矩阵/矢量，其中可能包含 '[VERTICAL_SPLIT]' 标记），你**必须**根据上下文将其还原为标准的 LaTeX 格式（使用 `$$...$$` 或 `$...$`）。
-       - 例子：看到 'E_in = 1 [VERTICAL_SPLIT] 0 (1)'，请输出 '入射琼斯矢量表示为：$$ E_{in} = \begin{{pmatrix}} 1 \\\\ 0 \end{{pmatrix}} \quad (1) $$'
-    3. **绝对禁止**直接输出英文原文。必须翻译！
-    4. 不要输出任何解释性文字，只输出翻译后的正文。
-    """
+    sys_prompt = _SYS_PROMPT_BASE
     if is_caption: 
-        sys_prompt += " (注意：这是图片说明，请保留 Figure 编号，例如 '图1(a) 展示了...') "
+        sys_prompt += _SYS_PROMPT_CAPTION
 
     for attempt in range(max_retries):
         client = get_next_client()
         if not client: return "[Key未配置]"
         
         try:
-            # 使用预清洗后的文本
             response = client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[
@@ -246,7 +246,6 @@ def smart_merge_blocks(blocks):
                 current_text = b_text
                 current_rect = b_rect
             else:
-                # 距离近，拼合，用换行符连接
                 current_text += "\n" + b_text 
                 current_rect = current_rect | b_rect 
         else:
@@ -294,7 +293,6 @@ def batch_translate_elements(elements):
     
     if not tasks: return elements
 
-    # 稳定版，保持低并发
     max_workers = 4 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(executor.map(lambda p: translate_text(p[0], p[1]), tasks))
@@ -404,7 +402,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         return False, str(e)
 
 # --- 5. 界面逻辑 ---
-st.title("🔬 光学室学术论文翻译 (V50 终极稳定版)")
+st.title("🔬 光学室学术论文翻译 (V51 终极语法稳定版)")
 
 with st.sidebar:
     st.markdown("""
@@ -412,7 +410,7 @@ with st.sidebar:
         <h4 style="margin:0; color:#333;">👤 专属定制</h4>
         <p style="margin:5px 0 0 0; font-size:14px; color:#555;">
         <strong>制作人：</strong> 白水<br>
-        <strong>版本：</strong> V50 (代码稳定，LLM 强化修复)<br>
+        <strong>版本：</strong> V51 (语法修复，代码稳定)<br>
         <strong>微信：</strong> <code style="background:white;">guo21615</code>
         </p>
     </div>
@@ -482,7 +480,7 @@ if uploaded_file:
                     if ok:
                         bar.progress(100)
                         status.success("✅ 修复完成！程序稳定了！")
-                        fname = "Translation_V50_Stable.pdf"
+                        fname = "Translation_V51_Stable.pdf"
                         with open(tmp_pdf.name, "rb") as f:
                             st.download_button("📥 下载文件", f, fname)
                     else:
