@@ -12,21 +12,36 @@ import shutil
 import platform
 import streamlit.components.v1 as components
 from concurrent.futures import ThreadPoolExecutor
+from itertools import cycle
+import time
 
-# --- 0. 配置部分 ---
-try:
-    API_KEY = st.secrets["DEEPSEEK_API_KEY"]
-except:
-    API_KEY = "sk-xxxxxxxx" 
+# ==========================================
+# 👇 【关键配置】请在这里填入你的 API Key 👇
+# ==========================================
+USER_KEYS = [
+    "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 
+]
+# ==========================================
 
 BASE_URL = "https://api.deepseek.com"
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+
+# --- 初始化 Key 轮询器 ---
+VALID_KEYS = [k.strip() for k in USER_KEYS if k.strip().startswith("sk-")]
+if not VALID_KEYS:
+    try:
+        if "DEEPSEEK_API_KEY" in st.secrets:
+            VALID_KEYS = [st.secrets["DEEPSEEK_API_KEY"]]
+    except:
+        pass
+
+KEY_CYCLE = cycle(VALID_KEYS) if VALID_KEYS else None
 
 st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
 
-# --- 1. CSS 生成器 ---
+# --- CSS 样式 (经典 V27 布局) ---
 def get_css(font_size, line_height, img_width_pct):
-    text_width_pct = 100 - img_width_pct - 2 
+    text_width_pct = 100 - img_width_pct - 2
     
     return f"""
     <style>
@@ -34,7 +49,7 @@ def get_css(font_size, line_height, img_width_pct):
 
         @page {{
             size: A4 landscape;
-            margin: 15mm; 
+            margin: 10mm; 
         }}
 
         body {{
@@ -47,79 +62,74 @@ def get_css(font_size, line_height, img_width_pct):
             background-color: white;
         }}
 
-        .page-container {{
-            width: 100%;
-            margin: 0 auto;
+        .page-container {{ 
+            width: 100%; 
+            margin: 0 auto; 
+            page-break-after: always; /* 每一页强制换页 */
+        }}
+        
+        .page-marker {{
+            text-align: center; font-size: 12px; color: #aaa; 
+            margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;
         }}
 
-        /* 左右对照布局 */
+        /* 核心布局：左图右文 */
         .split-layout {{
             display: flex;
             flex-direction: row;
             gap: 20px;
-            margin-bottom: 30px;
             align-items: flex-start;
-            border-bottom: 1px dashed #ccc;
-            padding-bottom: 30px;
-            page-break-inside: avoid;
+            height: 100%;
         }}
 
+        /* 左侧：整页截图 */
         .left-col-image {{
             width: {img_width_pct}%;
             flex-shrink: 0;
             border: 1px solid #ddd;
             box-shadow: 2px 2px 8px rgba(0,0,0,0.1);
-            border-radius: 4px;
-            overflow: hidden;
         }}
         
-        .left-col-image img {{
-            width: 100%;
-            height: auto;
-            display: block;
+        .left-col-image img {{ 
+            width: 100%; 
+            height: auto; 
+            display: block; 
         }}
 
+        /* 右侧：纯译文 */
         .right-col-text {{
             width: {text_width_pct}%;
-            padding-left: 5px;
+            padding: 10px;
             text-align: justify;
             overflow-wrap: break-word;
         }}
         
+        .right-col-text p {{
+            margin-bottom: 1.2em;
+            text-indent: 2em;
+        }}
+
         .MathJax {{ font-size: 100% !important; }}
-
-        /* 纯净模式 */
-        .pure-mode-container {{ max-width: 900px; margin: 0 auto; }}
-        .pure-mode-container p {{ margin-bottom: 1em; text-indent: 2em; }}
-        .pure-mode-container img {{ max-width: 80%; display: block; margin: 20px auto; }}
-
-        .caption {{ 
-            font-size: {font_size - 2}px;
-            color: #555; 
-            text-align: center; 
-            font-weight: bold; 
-            margin-bottom: 15px; 
-            font-family: sans-serif;
-        }}
-
-        .page-marker {{
-            text-align: center; font-size: 12px; color: #aaa; 
-            margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 5px;
-        }}
-        .page-break {{ page-break-before: always; }}
-        .page-break.first-page {{ page-break-before: avoid; }}
-        @media print {{ .page-break {{ height: 0; margin: 0; }} }}
     </style>
     """
 
 MATHJAX_SCRIPT = """
 <script>
-MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache: 'global' } };
+window.MathJax = {
+  tex: {
+    inlineMath: [['$', '$'], ['\\(', '\\)']],
+    displayMath: [['$$', '$$'], ['\\[', '\\]']],
+    processEscapes: true
+  },
+  svg: {
+    fontCache: 'global'
+  }
+};
 </script>
 <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 """
 
-# --- 2. 核心逻辑 ---
+# --- 核心逻辑 ---
 
 def image_to_base64(pil_image):
     buff = io.BytesIO()
@@ -127,22 +137,19 @@ def image_to_base64(pil_image):
     img_str = base64.b64encode(buff.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{img_str}"
 
-def is_header_or_footer(rect, page_height):
-    return rect.y1 < 50 or rect.y0 > page_height - 50
+def get_next_client():
+    if not KEY_CYCLE: return None
+    return OpenAI(api_key=next(KEY_CYCLE), base_url=BASE_URL)
 
-def is_caption_node(text):
-    text = text.strip()
-    return text.startswith("Fig.") or (text.startswith("Figure") and re.match(r'^Figure\s?\d+[.:]', text))
+def translate_text(text):
+    if len(text.strip()) < 5: return text 
+    
+    client = get_next_client()
+    if not client: return text
 
-def translate_text(text, is_caption=False):
-    if len(text.strip()) < 2: return text
-    sys_prompt = """你是一个专业的物理学术翻译。
-    【规则】
-    1. 保持学术严谨性。
-    2. 公式必须用 $...$ 或 $$...$$ 包裹。
-    3. 直接输出译文，不要加前缀。
-    """
-    if is_caption: sys_prompt += " (这是图注，保留编号)"
+    # V27 经典 Prompt：稳定、准确
+    sys_prompt = "你是一个物理学翻译专家。直接翻译以下学术文本，保持专业术语准确。公式保留原样（使用$$或$包裹）。不要解释，直接输出译文。"
+    
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
@@ -150,129 +157,75 @@ def translate_text(text, is_caption=False):
             stream=False
         )
         return response.choices[0].message.content
-    except: return text
-
-def batch_translate_elements(elements):
-    tasks = []
-    indices = []
-    for i, el in enumerate(elements):
-        if el['type'] in ['text', 'caption']:
-            tasks.append((el['content'], el['type'] == 'caption'))
-            indices.append(i)
-    
-    if not tasks: return elements
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(lambda p: translate_text(p[0], p[1]), tasks))
-    
-    for idx_in_tasks, idx_in_elements in enumerate(indices):
-        elements[idx_in_elements]['content'] = results[idx_in_tasks]
-    return elements
-
-def capture_image_between_blocks(page, prev_bottom, current_top):
-    if current_top - prev_bottom < 30: return None # 稍微放宽一点限制
-    # rect 的起始点 prev_bottom 必须考虑到页眉，不能太小
-    safe_top = max(prev_bottom + 5, 40) # 确保不抓到页眉
-    rect = fitz.Rect(50, safe_top, page.rect.width - 50, current_top - 5)
-    try:
-        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=rect, alpha=False)
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
-        return img if img.size[1] >= 20 else None
-    except: return None
-
-# --- V38 修复核心：parse_page ---
-def parse_page(page):
-    raw_elements = []
-    blocks = page.get_text("blocks", sort=True)
-    
-    # 关键修改 1：初始化为 50 (避开页眉)，而不是 0
-    # 这样如果第一个块是图注(位置200)，它会去扫描 50~200 之间的区域
-    last_bottom = 50 
-    
-    text_buffer = ""
-    valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page.rect.height)]
-    
-    for i, b in enumerate(valid_blocks):
-        b_rect = fitz.Rect(b[:4])
-        b_top = b_rect.y0
-        
-        # 关键修改 2：删除了 "if i==0... last_bottom=b_top" 这行代码
-        # 这样就不会跳过页面顶部的图片了
-
-        if is_caption_node(b[4]):
-            if text_buffer.strip():
-                raw_elements.append({'type': 'text', 'content': text_buffer})
-                text_buffer = ""
-            
-            # 抓取当前图注上方的区域
-            img = capture_image_between_blocks(page, last_bottom, b_top)
-            if img: raw_elements.append({'type': 'image', 'content': img})
-            
-            raw_elements.append({'type': 'caption', 'content': b[4]})
-        else:
-            text_buffer += b[4] + "\n\n"
-        
-        last_bottom = b_rect.y1
-        
-    if text_buffer.strip():
-        raw_elements.append({'type': 'text', 'content': text_buffer})
-        
-    return batch_translate_elements(raw_elements)
-
-def get_page_image(page):
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    return img
+    except:
+        return text
 
 def clean_latex(text):
-    return text.replace(r'\[', '$$').replace(r'\]', '$$').replace(r'\(', '$').replace(r'\)', '$')
+    text = text.replace(r'\[', '$$').replace(r'\]', '$$')
+    text = text.replace(r'\(', '$').replace(r'\)', '$')
+    return text
 
-# --- 3. HTML 构建器 ---
-def generate_html(doc, start, end, mode="pure", filename="Document", font_size=14, line_height=1.6, img_width=50):
-    dynamic_css = get_css(font_size, line_height, img_width)
-    html_body = f'<div class="page-container">'
+def process_page_v27(page):
+    # 1. 左侧：获取整页高清图
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    img_b64 = image_to_base64(img)
+
+    # 2. 右侧：提取文本
+    page_height = page.rect.height
+    blocks = page.get_text("blocks", sort=True)
+    valid_text_blocks = []
     
-    for page_num in range(start, end + 1):
-        page = doc[page_num-1]
-        marker_class = "page-break first-page" if page_num == start else "page-break"
-        html_body += f'<div class="{marker_class}"><div class="page-marker">- 第 {page_num} 页 -</div></div>'
+    for b in blocks:
+        y0, y1, text = b[1], b[3], b[4]
+        # 简单过滤页眉页脚
+        if y0 < 50 or y1 > page_height - 50: continue
+        if len(text.strip()) < 3: continue
+        valid_text_blocks.append(text)
+
+    # 3. 并发翻译
+    translated_paragraphs = []
+    if VALID_KEYS and valid_text_blocks:
+        # V27 默认满速并发
+        max_workers = 8 
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(translate_text, valid_text_blocks))
+        translated_paragraphs = results
+    else:
+        translated_paragraphs = valid_text_blocks
+
+    return img_b64, translated_paragraphs
+
+def generate_html_document(doc, start_page, end_page, font_size, line_height, img_width):
+    css = get_css(font_size, line_height, img_width)
+    html_content = f"<!DOCTYPE html><html><head><meta charset='utf-8'>{css}{MATHJAX_SCRIPT}</head><body>"
+    
+    progress_bar = st.progress(0)
+    total = end_page - start_page + 1
+    
+    for idx, page_num in enumerate(range(start_page, end_page + 1)):
+        page = doc[page_num - 1]
         
-        if mode == "screenshot":
-            page_els = parse_page(page) 
-            img_b64 = image_to_base64(get_page_image(page))
-            
-            html_body += f"""
+        img_b64, paragraphs = process_page_v27(page)
+        
+        html_content += f"""
+        <div class="page-container">
+            <div class="page-marker">- 第 {page_num} 页 -</div>
             <div class="split-layout">
                 <div class="left-col-image"><img src="{img_b64}" /></div>
                 <div class="right-col-text">
-            """
-            for el in page_els:
-                if el['type'] == 'text':
-                    paras = clean_latex(el['content']).split('\n\n')
-                    for p in paras:
-                        if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
-                elif el['type'] == 'caption':
-                    html_body += f'<div class="caption">图注: {el["content"]}</div>'
-            html_body += "</div></div>"
-            
-        else:
-            page_els = parse_page(page)
-            html_body += '<div class="pure-mode-container">'
-            for el in page_els:
-                if el['type'] == 'text':
-                    paras = clean_latex(el['content']).split('\n\n')
-                    for p in paras:
-                        if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
-                elif el['type'] == 'image':
-                    html_body += f'<img src="{image_to_base64(el["content"])}" />'
-                elif el['type'] == 'caption':
-                    html_body += f'<div class="caption">{el["content"]}</div>'
-            html_body += '</div>'
+        """
+        for p in paragraphs:
+            clean_p = clean_latex(p).replace('\n', ' ')
+            if clean_p.strip(): html_content += f"<p>{clean_p}</p>"
                 
-    html_body += "</div>"
-    return f"<!DOCTYPE html><html><head><meta charset='utf-8'>{dynamic_css}{MATHJAX_SCRIPT}</head><body>{html_body}</body></html>"
+        html_content += "</div></div></div>"
+        progress_bar.progress((idx + 1) / total)
+    
+    html_content += "</body></html>"
+    return html_content
 
-# --- 4. PDF 引擎 ---
+# --- PDF 导出 ---
 def get_chrome_path():
     if shutil.which("chromium"): return shutil.which("chromium")
     if shutil.which("chromium-browser"): return shutil.which("chromium-browser")
@@ -284,102 +237,70 @@ def get_chrome_path():
         if os.path.exists(p): return p
     return None
 
-def html_to_pdf_with_chrome(html_content, output_pdf_path):
-    chrome_bin = get_chrome_path()
-    if not chrome_bin: return False, "❌ 未找到浏览器核心"
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as tmp_html:
-        tmp_html.write(html_content)
-        tmp_html_path = tmp_html.name
-
+def html_to_pdf(html_str, output_path):
+    chrome = get_chrome_path()
+    if not chrome: return False, "未找到 Chrome 浏览器"
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as f:
+        f.write(html_str)
+        tmp_html = f.name
+        
     cmd = [
-        chrome_bin, "--headless", "--disable-gpu", 
-        f"--print-to-pdf={output_pdf_path}",
-        "--no-pdf-header-footer", 
-        "--virtual-time-budget=5000",
-        f"file://{tmp_html_path}"
+        chrome, "--headless", "--disable-gpu", 
+        f"--print-to-pdf={output_path}",
+        "--no-pdf-header-footer",
+        f"file://{tmp_html}"
     ]
     if platform.system() == "Linux": cmd.insert(1, "--no-sandbox")
-
+    
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, check=True, timeout=60)
         return True, "Success"
     except Exception as e:
         return False, str(e)
 
-# --- 5. 界面逻辑 ---
-st.title("🔬 光学室学术论文翻译专用版 (V38 顶部图修复)")
+# --- 界面 ---
+st.title("🔬 光学室学术论文翻译 (V27 经典稳定版)")
+st.markdown("**特点：左侧原版整页截图（图表绝对不丢），右侧AI翻译。**")
 
 with st.sidebar:
-    st.markdown("""
-    <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #dcdcdc;">
-        <h4 style="margin:0; color:#333;">👤 专属定制</h4>
-        <p style="margin:5px 0 0 0; font-size:14px; color:#555;">
-        <strong>制作人：</strong> 白水<br>
-        <strong>微信：</strong> <code style="background:white;">guo21615</code>
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.success(f"✅ 已加载 {len(VALID_KEYS)} 个 API Key")
     uploaded_file = st.file_uploader("上传 PDF", type="pdf")
     
     st.markdown("---")
-    with st.expander("🎨 排版设置 (防溢出)", expanded=True):
-        ui_font_size = st.slider("字体大小 (px)", 10, 18, 14)
-        ui_line_height = st.slider("行间距", 1.2, 2.0, 1.6, 0.1)
-        ui_img_width = st.slider("左图占比 (%)", 30, 70, 48)
-
-    st.markdown("---")
-    app_mode = st.radio("功能模式", ["👁️ 实时预览", "🖨️ 导出 PDF"])
-    if app_mode == "🖨️ 导出 PDF":
-        export_style = st.radio("导出风格：", ["纯净译文版", "中英对照版 (左图右文)"], index=1)
+    font_size = st.slider("字体大小", 10, 20, 13)
+    line_height = st.slider("行高", 1.0, 2.0, 1.5)
+    img_width = st.slider("左侧原图占比 (%)", 20, 80, 50)
 
 if uploaded_file:
-    pdf_bytes = uploaded_file.read()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+    st.success(f"PDF 加载成功，共 {len(doc)} 页")
     
-    if app_mode == "👁️ 实时预览":
-        with st.sidebar:
-            st.markdown("---")
-            page_num = st.number_input("页码", 1, len(doc), 1)
-            if st.button("🔄 翻译此页", type="primary"):
-                st.session_state['run_preview'] = True
-        
-        if st.session_state.get('run_preview'):
-             with st.spinner("🚀 渲染预览中..."):
-                preview_html = generate_html(doc, page_num, page_num, mode="screenshot", 
-                                             font_size=ui_font_size, 
-                                             line_height=ui_line_height,
-                                             img_width=ui_img_width)
-                components.html(preview_html, height=800, scrolling=True)
+    col1, col2 = st.columns(2)
+    with col1: start = st.number_input("起始页", 1, len(doc), 1)
+    with col2: end = st.number_input("结束页", 1, len(doc), min(len(doc), 5))
+    
+    if st.button("🚀 开始翻译并生成 PDF"):
+        if not VALID_KEYS:
+            st.error("请先配置 API Key！")
         else:
-             st.info("👈 点击“翻译此页”")
-
-    else:
-        st.subheader("📄 批量导出")
-        c1, c2 = st.columns(2)
-        with c1: start = st.number_input("起始页", 1, len(doc), 1)
-        with c2: end = st.number_input("结束页", 1, len(doc), min(3, len(doc)))
-        
-        style_code = "screenshot" if "对照" in export_style else "pure"
-        
-        if st.button(f"🚀 生成 PDF", type="primary"):
-            bar = st.progress(0)
-            status = st.empty()
-            
-            status.text("正在并发翻译...")
-            full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name,
-                                      font_size=ui_font_size,
-                                      line_height=ui_line_height,
-                                      img_width=ui_img_width)
-            
-            status.text("正在生成 PDF...")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-                ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
-                if ok:
-                    bar.progress(100)
-                    status.success("✅ 完成！")
-                    fname = "Translation_FixTop.pdf"
-                    with open(tmp_pdf.name, "rb") as f:
-                        st.download_button("📥 下载文件", f, fname)
+            with st.status("正在处理...", expanded=True) as status:
+                st.write("正在解析页面并并行翻译...")
+                html_result = generate_html_document(doc, start, end, font_size, line_height, img_width)
+                
+                st.write("正在调用浏览器生成 PDF...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as pdf_tmp:
+                    success, msg = html_to_pdf(html_result, pdf_tmp.name)
+                    
+                if success:
+                    status.update(label="✅ 完成！", state="complete", expanded=False)
+                    with open(pdf_tmp.name, "rb") as f:
+                        st.download_button(
+                            label="📥 下载翻译结果 (PDF)",
+                            data=f,
+                            file_name="Translation_V27_Stable.pdf",
+                            mime="application/pdf"
+                        )
                 else:
-                    st.error(f"失败: {msg}")
+                    status.update(label="❌ 失败", state="error")
+                    st.error(f"PDF 生成失败: {msg}")
