@@ -3,115 +3,133 @@ import fitz  # PyMuPDF
 from openai import OpenAI
 from PIL import Image
 import io
+import re
 import base64
 import os
 import subprocess
 import tempfile
 import shutil
 import platform
+import streamlit.components.v1 as components
+from concurrent.futures import ThreadPoolExecutor
+from itertools import cycle
 import time
 
 # ==========================================
-# 👇 这里填你的 Key，多填几个轮换更稳 👇
+# 👇 【关键配置】请在这里填入你的 API Key 👇
 # ==========================================
 USER_KEYS = [
     "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 
 ]
 # ==========================================
 
 BASE_URL = "https://api.deepseek.com"
 
-st.set_page_config(page_title="光学室学术论文翻译 (V27 经典版)", page_icon="🔬", layout="wide")
+# --- 初始化 Key 轮询器 ---
+VALID_KEYS = [k.strip() for k in USER_KEYS if k.strip().startswith("sk-")]
+if not VALID_KEYS:
+    try:
+        if "DEEPSEEK_API_KEY" in st.secrets:
+            VALID_KEYS = [st.secrets["DEEPSEEK_API_KEY"]]
+    except:
+        pass
 
-# --- CSS: 还原图1那种紧凑的“左图右文”样式 ---
-def get_css(font_size=13, line_height=1.4):
+KEY_CYCLE = cycle(VALID_KEYS) if VALID_KEYS else None
+
+st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
+
+# --- CSS 样式 (经典 V27 左图右文布局) ---
+def get_css(font_size, line_height, img_width_pct):
+    text_width_pct = 100 - img_width_pct - 2
+    
     return f"""
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&display=swap');
-        
+
         @page {{
             size: A4 landscape;
-            margin: 0;
+            margin: 10mm; 
         }}
-        
+
         body {{
             font-family: "Noto Serif SC", "SimSun", serif;
-            font-size: {font_size}pt;
+            font-size: {font_size}px;
             line-height: {line_height};
-            color: #000;
+            color: #111;
             margin: 0;
             padding: 0;
             background-color: white;
         }}
 
-        .page-container {{
-            width: 297mm; /* A4 横向宽度 */
-            height: 210mm; /* A4 横向高度 */
-            page-break-after: always;
+        .page-container {{ 
+            width: 100%; 
+            margin: 0 auto; 
+            page-break-after: always; /* 每一页强制换页 */
+        }}
+        
+        .page-marker {{
+            text-align: center; font-size: 12px; color: #aaa; 
+            margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;
+        }}
+
+        /* 核心布局：左图右文 */
+        .split-layout {{
             display: flex;
             flex-direction: row;
-            overflow: hidden;
-            border-bottom: 1px dashed #ddd; /* 屏幕预览时方便看界线 */
+            gap: 20px;
+            align-items: flex-start;
+            height: 100%;
         }}
 
-        /* 左侧：原图区域 */
-        .left-col {{
-            width: 50%;
-            height: 100%;
-            border-right: 1px solid #ccc;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+        /* 左侧：整页截图 */
+        .left-col-image {{
+            width: {img_width_pct}%;
+            flex-shrink: 0;
+            border: 1px solid #ddd;
+            box-shadow: 2px 2px 8px rgba(0,0,0,0.1);
+        }}
+        
+        .left-col-image img {{ 
+            width: 100%; 
+            height: auto; 
+            display: block; 
+        }}
+
+        /* 右侧：纯译文 */
+        .right-col-text {{
+            width: {text_width_pct}%;
             padding: 10px;
-            box-sizing: border-box;
-            background-color: #fcfcfc;
-        }}
-        
-        .left-col img {{
-            max-width: 100%;
-            max-height: 100%;
-            object-fit: contain; /* 保证原图完整显示，不变形 */
-        }}
-
-        /* 右侧：译文区域 */
-        .right-col {{
-            width: 50%;
-            height: 100%;
-            padding: 25px 30px; /* 给文字留点呼吸感 */
-            box-sizing: border-box;
-            overflow-y: auto; /* 内容太多时允许滚动（PDF中会自动截断，但通常够用） */
             text-align: justify;
-        }}
-
-        .right-col p {{
-            margin-bottom: 1em;
-            text-indent: 2em; /* 首行缩进，更像论文 */
+            overflow-wrap: break-word;
         }}
         
-        .right-col .caption {{
-            font-size: 0.9em;
-            color: #444;
-            font-weight: bold;
-            margin: 1em 0;
-            text-indent: 0;
-            text-align: center;
-            background: #f0f0f0;
-            padding: 5px;
-            border-radius: 4px;
+        .right-col-text p {{
+            margin-bottom: 1.2em;
+            text-indent: 2em;
         }}
 
-        /* 隐藏Streamlit默认元素 */
-        header, footer {{ display: none !important; }}
+        .MathJax {{ font-size: 100% !important; }}
     </style>
     """
 
-# --- 核心功能函数 ---
+MATHJAX_SCRIPT = """
+<script>
+window.MathJax = {
+  tex: {
+    inlineMath: [['$', '$'], ['\\(', '\\)']],
+    displayMath: [['$$', '$$'], ['\\[', '\\]']],
+    processEscapes: true
+  },
+  svg: {
+    fontCache: 'global'
+  }
+};
+</script>
+<script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+"""
 
-def get_client():
-    # 简单的 Key 轮询
-    valid_keys = [k for k in USER_KEYS if k.startswith("sk-")]
-    if not valid_keys: return None
-    return OpenAI(api_key=valid_keys[0], base_url=BASE_URL)
+# --- 核心逻辑 ---
 
 def image_to_base64(pil_image):
     buff = io.BytesIO()
@@ -119,172 +137,170 @@ def image_to_base64(pil_image):
     img_str = base64.b64encode(buff.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{img_str}"
 
-# V27 的经典翻译逻辑：不整那些花里胡哨的，就是一段一段硬翻
-def translate_block(text):
-    client = get_client()
-    if not client: return "【Error: 请配置 API Key】" + text
+def get_next_client():
+    if not KEY_CYCLE: return None
+    return OpenAI(api_key=next(KEY_CYCLE), base_url=BASE_URL)
+
+def translate_text(text):
+    if len(text.strip()) < 5: return text 
     
-    # 你的图1里是纯中文，所以这里强制要求中文
-    prompt = "你是一个专业的光学物理翻译助手。请将以下学术文本段落翻译成地道的中文。保留所有公式（使用LaTeX格式 $$...$$ 或 $...$）。不要啰嗦，直接给译文。"
+    client = get_next_client()
+    if not client: return text
+
+    # V27 经典 Prompt：稳定、准确
+    sys_prompt = "你是一个物理学翻译专家。直接翻译以下学术文本，保持专业术语准确。公式保留原样（使用$$或$包裹）。不要解释，直接输出译文。"
     
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text}
-            ],
-            stream=False,
-            temperature=0.1 # 降温，保证准确
+            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": text}],
+            stream=False
         )
         return response.choices[0].message.content
-    except Exception as e:
-        print(f"Translation Error: {e}")
-        time.sleep(1) # 稍微缓一下
-        return text # 失败返回原文，别报错
+    except:
+        return text
 
-def process_pdf_page(page):
-    # 1. 搞定左边的图
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+def clean_latex(text):
+    text = text.replace(r'\[', '$$').replace(r'\]', '$$')
+    text = text.replace(r'\(', '$').replace(r'\)', '$')
+    return text
+
+def process_page_v27(page):
+    # 1. 左侧：获取整页高清图 (最稳的方案)
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
     img_b64 = image_to_base64(img)
-    
-    # 2. 搞定右边的字 (使用 V27 的简单提取逻辑)
-    # 不去管什么坐标对齐，直接按阅读顺序提取文本块
+
+    # 2. 右侧：提取文本
+    page_height = page.rect.height
     blocks = page.get_text("blocks", sort=True)
-    
-    translated_content = []
+    valid_text_blocks = []
     
     for b in blocks:
-        text = b[4].strip()
-        # 过滤掉页眉页脚和太短的干扰项
-        if len(text) < 5: continue 
-        if text.isdigit(): continue # 只有页码
-        
-        # 判断是不是图注 (Figure 开头)
-        is_caption = text.lower().startswith("fig")
-        
-        # 翻译！
-        trans = translate_block(text)
-        
-        # 简单的清洗
-        trans = trans.replace("```latex", "").replace("```", "")
-        
-        if is_caption:
-            translated_content.append(f'<div class="caption">{trans}</div>')
-        else:
-            translated_content.append(f'<p>{trans}</p>')
-            
-    return img_b64, "".join(translated_content)
+        y0, y1, text = b[1], b[3], b[4]
+        # 简单过滤页眉页脚
+        if y0 < 50 or y1 > page_height - 50: continue
+        if len(text.strip()) < 3: continue
+        valid_text_blocks.append(text)
 
-def generate_html(doc, start, end):
-    html_body = ""
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    total = end - start + 1
-    
-    for i, p_num in enumerate(range(start, end + 1)):
-        status_text.text(f"正在处理第 {p_num} 页 (V27 稳定模式)...")
-        page = doc[p_num-1]
-        
-        img_data, text_data = process_pdf_page(page)
-        
-        html_body += f"""
-        <div class="page-container">
-            <div class="left-col">
-                <img src="{img_data}">
-            </div>
-            <div class="right-col">
-                {text_data}
-            </div>
-        </div>
-        """
-        progress_bar.progress((i + 1) / total)
-        
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        {get_css()}
-        <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
-        <script>
-        MathJax = {{ tex: {{ inlineMath: [['$', '$'], ['\\(', '\\)']] }} }};
-        </script>
-    </head>
-    <body>
-        {html_body}
-    </body>
-    </html>
-    """
-
-# --- PDF 导出引擎 ---
-def html_to_pdf(html_content, output_path):
-    # 寻找 Chrome
-    chrome_bin = None
-    if shutil.which("chromium"): chrome_bin = shutil.which("chromium")
-    elif shutil.which("google-chrome"): chrome_bin = shutil.which("google-chrome")
+    # 3. 翻译 (为了求稳，这里虽然用了线程池，但你可以通过调低 max_workers 变成单线程)
+    translated_paragraphs = []
+    if VALID_KEYS and valid_text_blocks:
+        # 这里的 8 可以改成 1 变成绝对单线程，或者 4 适度并发
+        max_workers = 4 
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(translate_text, valid_text_blocks))
+        translated_paragraphs = results
     else:
-        # Mac / Win 常见路径
-        possible = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-        ]
-        for p in possible:
-            if os.path.exists(p): chrome_bin = p; break
-            
-    if not chrome_bin: return False, "未找到 Chrome 浏览器，无法导出 PDF"
+        translated_paragraphs = valid_text_blocks
 
+    return img_b64, translated_paragraphs
+
+def generate_html_document(doc, start_page, end_page, font_size, line_height, img_width):
+    css = get_css(font_size, line_height, img_width)
+    html_content = f"<!DOCTYPE html><html><head><meta charset='utf-8'>{css}{MATHJAX_SCRIPT}</head><body>"
+    
+    progress_bar = st.progress(0)
+    total = end_page - start_page + 1
+    
+    for idx, page_num in enumerate(range(start_page, end_page + 1)):
+        page = doc[page_num - 1]
+        
+        img_b64, paragraphs = process_page_v27(page)
+        
+        html_content += f"""
+        <div class="page-container">
+            <div class="page-marker">- 第 {page_num} 页 -</div>
+            <div class="split-layout">
+                <div class="left-col-image"><img src="{img_b64}" /></div>
+                <div class="right-col-text">
+        """
+        for p in paragraphs:
+            clean_p = clean_latex(p).replace('\n', ' ')
+            if clean_p.strip(): html_content += f"<p>{clean_p}</p>"
+                
+        html_content += "</div></div></div>"
+        progress_bar.progress((idx + 1) / total)
+    
+    html_content += "</body></html>"
+    return html_content
+
+# --- PDF 导出 ---
+def get_chrome_path():
+    if shutil.which("chromium"): return shutil.which("chromium")
+    if shutil.which("chromium-browser"): return shutil.which("chromium-browser")
+    mac_paths = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    for p in mac_paths: 
+        if os.path.exists(p): return p
+    win_paths = [r"C:\Program Files\Google\Chrome\Application\chrome.exe"]
+    for p in win_paths: 
+        if os.path.exists(p): return p
+    return None
+
+def html_to_pdf(html_str, output_path):
+    chrome = get_chrome_path()
+    if not chrome: return False, "未找到 Chrome 浏览器"
+    
     with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as f:
-        f.write(html_content)
+        f.write(html_str)
         tmp_html = f.name
         
     cmd = [
-        chrome_bin, "--headless", "--disable-gpu",
+        chrome, "--headless", "--disable-gpu", 
         f"--print-to-pdf={output_path}",
-        "--no-pdf-header-footer", # 去掉浏览器自带的页眉页脚
+        "--no-pdf-header-footer",
         f"file://{tmp_html}"
     ]
-    
     if platform.system() == "Linux": cmd.insert(1, "--no-sandbox")
-
+    
     try:
-        subprocess.run(cmd, check=True, timeout=120) # V27 给多点时间渲染
-        return True, "成功"
+        subprocess.run(cmd, check=True, timeout=60)
+        return True, "Success"
     except Exception as e:
         return False, str(e)
 
-# --- 主界面 ---
-st.title("🔬 光学室论文翻译 (V27 经典复刻版)")
-st.markdown("这是你最喜欢的那个版本：**左侧整页原图，右侧纯净中文。** 不搞复杂排版，只求内容对、公式对。")
+# --- 界面 ---
+st.title("🔬 光学室学术论文翻译 (V27 经典回归版)")
+st.markdown("**特点：左侧原版整页截图（图表绝对不丢），右侧AI翻译。**")
 
 with st.sidebar:
-    st.info("💡 提示：此版本为单线程处理，速度较慢但极度稳定。")
-    uploaded_file = st.file_uploader("📄 上传 PDF", type=["pdf"])
+    st.success(f"✅ 已加载 {len(VALID_KEYS)} 个 API Key")
+    uploaded_file = st.file_uploader("上传 PDF", type="pdf")
+    
+    st.markdown("---")
+    font_size = st.slider("字体大小", 10, 20, 13)
+    line_height = st.slider("行高", 1.0, 2.0, 1.5)
+    img_width = st.slider("左侧原图占比 (%)", 20, 80, 50)
 
 if uploaded_file:
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+    st.success(f"PDF 加载成功，共 {len(doc)} 页")
     
     col1, col2 = st.columns(2)
-    with col1: start_page = st.number_input("起始页", 1, len(doc), 1)
-    with col2: end_page = st.number_input("结束页", 1, len(doc), min(5, len(doc)))
+    with col1: start = st.number_input("起始页", 1, len(doc), 1)
+    with col2: end = st.number_input("结束页", 1, len(doc), min(len(doc), 5))
     
-    if st.button("🚀 开始翻译并导出 PDF", type="primary"):
-        if not get_client():
-            st.error("❌ 没填 API Key，跑不动！请在代码顶部填入 USER_KEYS。")
+    if st.button("🚀 开始翻译并生成 PDF"):
+        if not VALID_KEYS:
+            st.error("请先配置 API Key！")
         else:
-            with st.spinner("⏳ 正在慢工出细活 (每页约需 30秒 - 1分钟)..."):
-                html_out = generate_html(doc, start_page, end_page)
+            with st.status("正在处理...", expanded=True) as status:
+                st.write("正在解析页面并并行翻译...")
+                html_result = generate_html_document(doc, start, end, font_size, line_height, img_width)
                 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-                    success, msg = html_to_pdf(html_out, tmp_pdf.name)
+                st.write("正在调用浏览器生成 PDF...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as pdf_tmp:
+                    success, msg = html_to_pdf(html_result, pdf_tmp.name)
                     
-                    if success:
-                        st.success("✅ 翻译完成！")
-                        with open(tmp_pdf.name, "rb") as f:
-                            st.download_button("📥 下载完美翻译版 PDF", f, "V27_Classic_Translation.pdf")
-                    else:
-                        st.error(f"⚠️ PDF 生成失败: {msg}")
-                        # 失败了至少把 HTML 给用户
-                        st.download_button("📥 下载 HTML (备用)", html_out, "debug.html")
+                if success:
+                    status.update(label="✅ 完成！", state="complete", expanded=False)
+                    with open(pdf_tmp.name, "rb") as f:
+                        st.download_button(
+                            label="📥 下载翻译结果 (PDF)",
+                            data=f,
+                            file_name="Translation_V27_Stable.pdf",
+                            mime="application/pdf"
+                        )
+                else:
+                    status.update(label="❌ 失败", state="error")
+                    st.error(f"PDF 生成失败: {msg}")
