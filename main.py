@@ -21,16 +21,16 @@ except:
 BASE_URL = "https://api.deepseek.com"
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-# 1. 界面配置：网页标题依然叫“光学室专用版”，有排面！
+# V27 核心配置：Wide 布局以适应可能的双栏需求
 st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
 
-# --- 1. CSS 样式 (保持纯净学术风，解决方框乱码) ---
+# --- 1. CSS 样式 (V27 核心样式 + 截图对照布局) ---
 COMMON_CSS = """
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&display=swap');
 
     body {
-        /* 优先使用宋体/衬线体，确保学术感 */
+        /* V27 经典字体栈 */
         font-family: "Noto Serif SC", "Noto Sans CJK SC", "WenQuanYi Micro Hei", "SimSun", serif;
         font-size: 16px;
         line-height: 1.6;
@@ -40,23 +40,55 @@ COMMON_CSS = """
         background-color: white;
     }
 
+    /* 页面容器 */
     .page-container {
-        max-width: 800px;
+        width: 100%;
+        max-width: 1200px; /* 稍微宽一点以适应双栏 */
         margin: 0 auto;
         padding: 40px;
         background-color: #fff;
-        text-align: justify;
     }
 
-    p { margin-bottom: 1em; text-indent: 2em; }
-    img { max-width: 95%; display: block; margin: 20px auto; }
+    /* === 模式 1: V27 纯净模式 === */
+    .pure-mode-container {
+        max-width: 800px; /* 纯文本模式限制宽度，模拟A4 */
+        margin: 0 auto;
+        text-align: justify;
+    }
+    .pure-mode-container p { margin-bottom: 1em; text-indent: 2em; }
+    .pure-mode-container img { max-width: 95%; display: block; margin: 20px auto; }
+
+    /* === 模式 2: 左图右文对照模式 === */
+    .split-layout {
+        display: flex;
+        flex-direction: row;
+        gap: 25px;
+        margin-bottom: 40px;
+        border-bottom: 1px dashed #ccc;
+        padding-bottom: 20px;
+    }
+    .left-col-image {
+        width: 50%;
+        flex-shrink: 0;
+        border: 1px solid #eee;
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.05);
+    }
+    .left-col-image img { width: 100%; display: block; }
     
+    .right-col-text {
+        width: 50%;
+        padding-left: 10px;
+        text-align: justify;
+    }
+    .right-col-text p { margin-bottom: 1em; text-indent: 0; } /* 对照模式不缩进，显得整齐 */
+
+    /* 通用样式 */
     .caption { 
         font-size: 14px; color: #444; text-align: center; 
         font-weight: bold; margin-bottom: 25px; font-family: sans-serif;
     }
 
-    /* 打印时完全隐藏分页标记 */
+    /* 分页控制 */
     .page-break { 
         page-break-before: always; border-top: 1px dashed #eee; 
         margin-top: 30px; padding-top: 10px; text-align: center; 
@@ -77,7 +109,7 @@ MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache:
 <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 """
 
-# --- 2. 核心逻辑 (保持不变) ---
+# --- 2. 核心逻辑 (V27 原版逻辑) ---
 def image_to_base64(pil_image):
     buff = io.BytesIO()
     pil_image.save(buff, format="PNG")
@@ -95,6 +127,7 @@ def is_caption_node(text):
 
 def translate_text(text, is_caption=False):
     if len(text.strip()) < 2: return text
+    # V27 的经典 Prompt，强调公式和严谨
     sys_prompt = """你是一个专业的物理学术翻译。请将文本翻译成流畅的学术中文。
     【规则】
     1. 保持学术严谨性。
@@ -120,6 +153,7 @@ def capture_image_between_blocks(page, prev_bottom, current_top):
         return img if img.size[1] >= 20 else None
     except: return None
 
+# V27 的经典解析函数
 def parse_page(page):
     elements = []
     blocks = page.get_text("blocks", sort=True)
@@ -150,33 +184,71 @@ def parse_page(page):
 def clean_latex(text):
     return text.replace(r'\[', '$$').replace(r'\]', '$$').replace(r'\(', '$').replace(r'\)', '$')
 
-# --- 3. HTML 构建器 (关键：这里不加封面，保持纯净) ---
-def generate_full_html(all_pages_data, filename="Document"):
-    # 纯净版 PDF：不加任何“白水制作”的 Header
+# 新增：获取全页截图 (用于对照模式)
+def get_page_image(page):
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    return img
+
+# --- 3. HTML 构建器 (混合 V27 和 截图模式) ---
+def generate_html(doc, start, end, mode="pure", filename="Document"):
     html_body = f'<div class="page-container">'
     
-    for idx, page_els in enumerate(all_pages_data):
-        page_class = "page-break first-page" if idx == 0 else "page-break"
-        html_body += f'<div class="{page_class}">- {idx+1} -</div>'
+    for page_num in range(start, end + 1):
+        page = doc[page_num-1]
         
-        for el in page_els:
-            if el['type'] == 'text':
-                paras = clean_latex(el['content']).split('\n\n')
-                for p in paras:
-                    if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
-            elif el['type'] == 'image':
-                html_body += f'<img src="{image_to_base64(el["content"])}" />'
-            elif el['type'] == 'caption':
-                html_body += f'<div class="caption">{el["content"]}</div>'
+        # 解析页面内容 (使用 V27 逻辑)
+        page_els = parse_page(page)
+        
+        # 分页标记
+        page_class = "page-break first-page" if page_num == start else "page-break"
+        html_body += f'<div class="{page_class}">- {page_num} -</div>'
+        
+        if mode == "screenshot":
+            # === 模式2: 截图对照 (V33 理念) ===
+            # 左边：整页原图
+            img_b64 = image_to_base64(get_page_image(page))
+            
+            html_body += f"""
+            <div class="split-layout">
+                <div class="left-col-image">
+                    <img src="{img_b64}" />
+                </div>
+                <div class="right-col-text">
+            """
+            
+            # 右边：V27 解析出的纯文本 (忽略提取的小图，因为左边大图里都有)
+            for el in page_els:
+                if el['type'] == 'text':
+                    paras = clean_latex(el['content']).split('\n\n')
+                    for p in paras:
+                        if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
+                elif el['type'] == 'caption':
+                    html_body += f'<div class="caption">图注: {el["content"]}</div>'
+            
+            html_body += "</div></div>"
+            
+        else:
+            # === 模式1: 纯净 V27 模式 ===
+            html_body += '<div class="pure-mode-container">'
+            for el in page_els:
+                if el['type'] == 'text':
+                    paras = clean_latex(el['content']).split('\n\n')
+                    for p in paras:
+                        if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
+                elif el['type'] == 'image':
+                    html_body += f'<img src="{image_to_base64(el["content"])}" />'
+                elif el['type'] == 'caption':
+                    html_body += f'<div class="caption">{el["content"]}</div>'
+            html_body += '</div>'
                 
     html_body += "</div>"
     return f"<!DOCTYPE html><html><head><meta charset='utf-8'>{COMMON_CSS}{MATHJAX_SCRIPT}</head><body>{html_body}</body></html>"
 
-# --- 4. PDF 引擎 ---
+# --- 4. PDF 引擎 (保持不变) ---
 def get_chrome_path():
     if shutil.which("chromium"): return shutil.which("chromium")
     if shutil.which("chromium-browser"): return shutil.which("chromium-browser")
-    # Mac/Win paths...
     mac_paths = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
     for p in mac_paths: 
         if os.path.exists(p): return p
@@ -188,7 +260,7 @@ def get_chrome_path():
 def html_to_pdf_with_chrome(html_content, output_pdf_path):
     chrome_bin = get_chrome_path()
     if not chrome_bin:
-        return False, "❌ 未找到浏览器核心，请检查 packages.txt"
+        return False, "❌ 未找到浏览器核心"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as tmp_html:
         tmp_html.write(html_content)
@@ -198,7 +270,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         chrome_bin, "--headless", "--disable-gpu", 
         f"--print-to-pdf={output_pdf_path}",
         "--no-pdf-header-footer", 
-        "--virtual-time-budget=8000",
+        "--virtual-time-budget=10000",
         f"file://{tmp_html_path}"
     ]
     if platform.system() == "Linux": cmd.insert(1, "--no-sandbox")
@@ -209,12 +281,11 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
     except Exception as e:
         return False, str(e)
 
-# --- 5. 界面逻辑 (关键：这里恢复你的名字！) ---
-# 界面大标题：保留“光学室专用版”
+# --- 5. 界面逻辑 (V27 风格 + 截图模式选项) ---
 st.title("🔬 光学室学术论文翻译专用版")
 
 with st.sidebar:
-    # 👇👇👇 恢复了这个漂亮的个人名片！👇👇👇
+    # V27 经典署名
     st.markdown("""
     <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #dcdcdc;">
         <h4 style="margin:0; color:#333;">👤 专属定制</h4>
@@ -224,60 +295,69 @@ with st.sidebar:
         </p>
     </div>
     """, unsafe_allow_html=True)
-    # 👆👆👆 只有网页上看得到，PDF 里不会有！👆👆👆
     
     uploaded_file = st.file_uploader("上传 PDF", type="pdf")
     st.markdown("---")
-    mode = st.radio("功能模式", ["👁️ 实时预览", "🖨️ 导出 PDF"])
+    
+    app_mode = st.radio("功能模式", ["👁️ 实时预览", "🖨️ 导出 PDF"])
+    
+    if app_mode == "🖨️ 导出 PDF":
+        st.markdown("##### 📄 导出格式")
+        # 这里集成了 V27 的纯净版 和 V33 的截图对照版
+        export_style = st.radio(
+            "选择风格：",
+            ["纯净译文版 (V27经典)", "中英对照版 (左图右文)"], 
+            index=0
+        )
 
 if uploaded_file:
     pdf_bytes = uploaded_file.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     
-    if mode == "👁️ 实时预览":
+    if app_mode == "👁️ 实时预览":
         with st.sidebar:
             st.markdown("---")
             page_num = st.number_input("页码", 1, len(doc), 1)
             if st.button("🔄 翻译此页", type="primary"):
                 st.session_state['run_preview'] = True
         
-        c1, c2 = st.columns([1, 1.2])
-        with c1:
-            st.subheader("原文")
-            pix = doc[page_num-1].get_pixmap(matrix=fitz.Matrix(2,2))
-            st.image(pix.tobytes("png"), use_container_width=True)
-        with c2:
-            st.subheader("译文预览")
-            if st.session_state.get('run_preview'):
-                with st.spinner("AI 解析中..."):
-                    els = parse_page(doc[page_num-1])
-                    preview_html = generate_full_html([els])
-                    components.html(preview_html, height=800, scrolling=True)
+        # 预览界面保持 V33 的左图右文逻辑，因为这样最直观
+        if st.session_state.get('run_preview'):
+             with st.spinner("V27 内核正在解析..."):
+                preview_html = generate_html(doc, page_num, page_num, mode="screenshot")
+                components.html(preview_html, height=800, scrolling=True)
+        else:
+             st.info("👈 点击“翻译此页”")
 
     else:
-        st.subheader("📄 批量导出 (纯净版)")
+        st.subheader("📄 批量导出")
         c1, c2 = st.columns(2)
         with c1: start = st.number_input("起始页", 1, len(doc), 1)
         with c2: end = st.number_input("结束页", 1, len(doc), min(3, len(doc)))
         
-        if st.button("🚀 生成 PDF", type="primary"):
-            data = []
+        # 逻辑判断
+        style_code = "screenshot" if "对照" in export_style else "pure"
+        
+        if st.button(f"🚀 生成 PDF ({export_style})", type="primary"):
             bar = st.progress(0)
             status = st.empty()
             
-            for i, p in enumerate(range(start, end + 1)):
-                status.text(f"正在处理第 {p} 页...")
-                data.append(parse_page(doc[p-1]))
-                bar.progress((i+1) / (end-start+1))
+            # 使用 generate_html 内部循环处理
+            status.text("正在使用 V27 内核解析并渲染...")
+            bar.progress(50)
             
-            status.text("正在合成纯净文档...")
-            full_html = generate_full_html(data, filename=uploaded_file.name)
+            full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name)
+            
+            bar.progress(80)
+            status.text("正在调用浏览器生成 PDF...")
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
                 ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
                 if ok:
+                    bar.progress(100)
                     status.success("✅ 完成！")
+                    fname = "Translation_Visual.pdf" if style_code == "screenshot" else "Translation_V27_Pure.pdf"
                     with open(tmp_pdf.name, "rb") as f:
-                        st.download_button("📥 下载翻译报告", f, "Translated_Paper.pdf")
+                        st.download_button("📥 下载文件", f, fname)
                 else:
                     st.error(f"失败: {msg}")
