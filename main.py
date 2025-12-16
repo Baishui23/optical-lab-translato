@@ -47,10 +47,7 @@ def get_css(font_size, line_height, img_width_pct):
             background-color: white;
         }}
 
-        .page-container {{
-            width: 100%;
-            margin: 0 auto;
-        }}
+        .page-container {{ width: 100%; margin: 0 auto; }}
 
         /* 左右对照布局 */
         .split-layout {{
@@ -73,11 +70,7 @@ def get_css(font_size, line_height, img_width_pct):
             overflow: hidden;
         }}
         
-        .left-col-image img {{
-            width: 100%;
-            height: auto;
-            display: block;
-        }}
+        .left-col-image img {{ width: 100%; height: auto; display: block; }}
 
         .right-col-text {{
             width: {text_width_pct}%;
@@ -95,11 +88,8 @@ def get_css(font_size, line_height, img_width_pct):
 
         .caption {{ 
             font-size: {font_size - 2}px;
-            color: #555; 
-            text-align: center; 
-            font-weight: bold; 
-            margin-bottom: 15px; 
-            font-family: sans-serif;
+            color: #555; text-align: center; font-weight: bold; 
+            margin-bottom: 15px; font-family: sans-serif;
         }}
 
         .page-marker {{
@@ -119,11 +109,12 @@ MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache:
 <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 """
 
-# --- 2. 核心逻辑 ---
+# --- 2. 核心逻辑 (多线程 + 稳定图像) ---
 
 def image_to_base64(pil_image):
     buff = io.BytesIO()
-    pil_image.save(buff, format="PNG")
+    # 修复：改回 PNG 格式，防止因 RGBA 透明通道导致 JPEG 保存失败
+    pil_image.save(buff, format="PNG") 
     img_str = base64.b64encode(buff.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{img_str}"
 
@@ -152,6 +143,7 @@ def translate_text(text, is_caption=False):
         return response.choices[0].message.content
     except: return text
 
+# 多线程并发翻译
 def batch_translate_elements(elements):
     tasks = []
     indices = []
@@ -162,6 +154,7 @@ def batch_translate_elements(elements):
     
     if not tasks: return elements
 
+    # 5线程并发
     with ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(lambda p: translate_text(p[0], p[1]), tasks))
     
@@ -170,25 +163,21 @@ def batch_translate_elements(elements):
     return elements
 
 def capture_image_between_blocks(page, prev_bottom, current_top):
-    if current_top - prev_bottom < 30: return None # 稍微放宽一点限制
-    # rect 的起始点 prev_bottom 必须考虑到页眉，不能太小
-    safe_top = max(prev_bottom + 5, 40) # 确保不抓到页眉
+    if current_top - prev_bottom < 30: return None
+    safe_top = max(prev_bottom + 5, 40)
     rect = fitz.Rect(50, safe_top, page.rect.width - 50, current_top - 5)
     try:
-        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=rect, alpha=False)
+        # Matrix(2,2) 保证速度和清晰度的平衡
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect, alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         return img if img.size[1] >= 20 else None
     except: return None
 
-# --- V38 修复核心：parse_page ---
+# 完整修复的解析逻辑
 def parse_page(page):
     raw_elements = []
     blocks = page.get_text("blocks", sort=True)
-    
-    # 关键修改 1：初始化为 50 (避开页眉)，而不是 0
-    # 这样如果第一个块是图注(位置200)，它会去扫描 50~200 之间的区域
-    last_bottom = 50 
-    
+    last_bottom = 50 # 修复顶部图 bug
     text_buffer = ""
     valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page.rect.height)]
     
@@ -196,15 +185,11 @@ def parse_page(page):
         b_rect = fitz.Rect(b[:4])
         b_top = b_rect.y0
         
-        # 关键修改 2：删除了 "if i==0... last_bottom=b_top" 这行代码
-        # 这样就不会跳过页面顶部的图片了
-
         if is_caption_node(b[4]):
             if text_buffer.strip():
                 raw_elements.append({'type': 'text', 'content': text_buffer})
                 text_buffer = ""
             
-            # 抓取当前图注上方的区域
             img = capture_image_between_blocks(page, last_bottom, b_top)
             if img: raw_elements.append({'type': 'image', 'content': img})
             
@@ -212,7 +197,7 @@ def parse_page(page):
         else:
             text_buffer += b[4] + "\n\n"
         
-        last_bottom = b_rect.y1
+        last_bottom = b_rect.y1 # 关键：更新底部坐标
         
     if text_buffer.strip():
         raw_elements.append({'type': 'text', 'content': text_buffer})
@@ -292,11 +277,12 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         tmp_html.write(html_content)
         tmp_html_path = tmp_html.name
 
+    # 稍微缩短等待时间到 3000ms 提升速度
     cmd = [
         chrome_bin, "--headless", "--disable-gpu", 
         f"--print-to-pdf={output_pdf_path}",
         "--no-pdf-header-footer", 
-        "--virtual-time-budget=5000",
+        "--virtual-time-budget=3000",
         f"file://{tmp_html_path}"
     ]
     if platform.system() == "Linux": cmd.insert(1, "--no-sandbox")
@@ -308,7 +294,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         return False, str(e)
 
 # --- 5. 界面逻辑 ---
-st.title("🔬 光学室学术论文翻译专用版 (V38 顶部图修复)")
+st.title("🔬 光学室学术论文翻译专用版 (V40 稳定极速版)")
 
 with st.sidebar:
     st.markdown("""
@@ -366,7 +352,7 @@ if uploaded_file:
             bar = st.progress(0)
             status = st.empty()
             
-            status.text("正在并发翻译...")
+            status.text("正在并发翻译 (5线程)...")
             full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name,
                                       font_size=ui_font_size,
                                       line_height=ui_line_height,
@@ -378,7 +364,7 @@ if uploaded_file:
                 if ok:
                     bar.progress(100)
                     status.success("✅ 完成！")
-                    fname = "Translation_FixTop.pdf"
+                    fname = "Translation_V40.pdf"
                     with open(tmp_pdf.name, "rb") as f:
                         st.download_button("📥 下载文件", f, fname)
                 else:
