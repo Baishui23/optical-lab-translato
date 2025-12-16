@@ -13,20 +13,43 @@ import platform
 import streamlit.components.v1 as components
 from concurrent.futures import ThreadPoolExecutor
 
-# --- 0. 配置部分 ---
-try:
-    API_KEY = st.secrets["DEEPSEEK_API_KEY"]
-except:
-    API_KEY = "sk-xxxxxxxx" 
-
-BASE_URL = "https://api.deepseek.com"
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-
+# ==========================================
+# 0. 配置部分 (API Key设置)
+# ==========================================
 st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
 
-# --- 1. CSS 生成器 (V37: 动态注入排版参数) ---
+# 优先从侧边栏获取，其次从 Secrets 获取，最后从代码默认值获取
+with st.sidebar:
+    st.markdown("### 🔑 API 设置")
+    user_api_input = st.text_input("DeepSeek API Key (可选)", type="password", help="如果不填，将尝试使用配置文件或默认Key")
+
+# 初始化 API_KEY
+API_KEY = None
+
+if user_api_input:
+    API_KEY = user_api_input
+else:
+    try:
+        API_KEY = st.secrets["DEEPSEEK_API_KEY"]
+    except:
+        # 👇 【如果本地运行且没有配置 secrets，请在这里填入你的 Key】
+        API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx" 
+
+BASE_URL = "https://api.deepseek.com"
+
+# 初始化 Client
+if API_KEY and API_KEY.startswith("sk-"):
+    client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+else:
+    client = None
+    # 仅在未提供有效 Key 时警告，不阻断 UI 渲染
+    # st.sidebar.warning("⚠️ 未检测到有效 API Key，翻译功能将不可用")
+
+# ==========================================
+# 1. CSS 生成器 (动态排版)
+# ==========================================
 def get_css(font_size, line_height, img_width_pct):
-    text_width_pct = 100 - img_width_pct - 2 # 预留2%间隙
+    text_width_pct = 100 - img_width_pct - 2
     
     return f"""
     <style>
@@ -39,8 +62,8 @@ def get_css(font_size, line_height, img_width_pct):
 
         body {{
             font-family: "Noto Serif SC", "SimSun", serif;
-            font-size: {font_size}px;  /* 动态字号 */
-            line-height: {line_height}; /* 动态行高 */
+            font-size: {font_size}px; 
+            line-height: {line_height};
             color: #111;
             margin: 0;
             padding: 0;
@@ -52,7 +75,6 @@ def get_css(font_size, line_height, img_width_pct):
             margin: 0 auto;
         }}
 
-        /* === 左右对照布局 (动态宽度) === */
         .split-layout {{
             display: flex;
             flex-direction: row;
@@ -65,7 +87,7 @@ def get_css(font_size, line_height, img_width_pct):
         }}
 
         .left-col-image {{
-            width: {img_width_pct}%;  /* 动态图片列宽 */
+            width: {img_width_pct}%;
             flex-shrink: 0;
             border: 1px solid #ddd;
             box-shadow: 2px 2px 8px rgba(0,0,0,0.1);
@@ -80,18 +102,14 @@ def get_css(font_size, line_height, img_width_pct):
         }}
 
         .right-col-text {{
-            width: {text_width_pct}%; /* 动态文字列宽 */
+            width: {text_width_pct}%;
             padding-left: 5px;
             text-align: justify;
-            overflow-wrap: break-word; /* 防止长单词撑破 */
+            overflow-wrap: break-word;
         }}
         
-        /* 针对公式的微调 */
-        .MathJax {{
-            font-size: 100% !important; /* 跟随正文字号 */
-        }}
+        .MathJax {{ font-size: 100% !important; }}
 
-        /* === 纯净模式 === */
         .pure-mode-container {{
             max-width: 900px;
             margin: 0 auto;
@@ -100,12 +118,13 @@ def get_css(font_size, line_height, img_width_pct):
         .pure-mode-container img {{ max-width: 80%; display: block; margin: 20px auto; }}
 
         .caption {{ 
-            font-size: {font_size - 2}px; /* 图注比正文小一点 */
+            font-size: {font_size - 2}px;
             color: #555; 
             text-align: center; 
             font-weight: bold; 
             margin-bottom: 15px; 
             font-family: sans-serif;
+            margin-top: 5px;
         }}
 
         .page-marker {{
@@ -125,7 +144,9 @@ MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache:
 <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 """
 
-# --- 2. 核心逻辑 (保持并发极速版) ---
+# ==========================================
+# 2. 核心逻辑 (图像识别与翻译)
+# ==========================================
 
 def image_to_base64(pil_image):
     buff = io.BytesIO()
@@ -134,21 +155,31 @@ def image_to_base64(pil_image):
     return f"data:image/png;base64,{img_str}"
 
 def is_header_or_footer(rect, page_height):
+    # 判定页眉页脚：页面最上方 50px 和最下方 50px
     return rect.y1 < 50 or rect.y0 > page_height - 50
 
+# --- 🔥 关键修改：正则增强，支持 Fig, Figure ---
 def is_caption_node(text):
     text = text.strip()
-    return text.startswith("Fig.") or (text.startswith("Figure") and re.match(r'^Figure\s?\d+[.:]', text))
+    # 匹配: Fig. 1, Figure 2, Fig 1, Figure. 1 等常见格式
+    pattern = r'^(Fig|Figure)(\.|,|\s)\s?\d+'
+    return re.match(pattern, text, re.IGNORECASE) is not None
+
+def clean_latex(text):
+    return text.replace(r'\[', '$$').replace(r'\]', '$$').replace(r'\(', '$').replace(r'\)', '$')
 
 def translate_text(text, is_caption=False):
+    if not client: return text # 如果没有API key，直接返回原文
     if len(text.strip()) < 2: return text
+    
     sys_prompt = """你是一个专业的物理学术翻译。
     【规则】
     1. 保持学术严谨性。
     2. 公式必须用 $...$ 或 $$...$$ 包裹。
     3. 直接输出译文，不要加前缀。
     """
-    if is_caption: sys_prompt += " (这是图注，保留编号)"
+    if is_caption: sys_prompt += " (这是图注，保留编号，例如 '图1: ...')"
+    
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
@@ -156,7 +187,9 @@ def translate_text(text, is_caption=False):
             stream=False
         )
         return response.choices[0].message.content
-    except: return text
+    except Exception as e:
+        print(f"Translation Error: {e}")
+        return text
 
 def batch_translate_elements(elements):
     tasks = []
@@ -168,6 +201,7 @@ def batch_translate_elements(elements):
     
     if not tasks: return elements
 
+    # 5线程并发翻译
     with ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(lambda p: translate_text(p[0], p[1]), tasks))
     
@@ -175,63 +209,67 @@ def batch_translate_elements(elements):
         elements[idx_in_elements]['content'] = results[idx_in_tasks]
     return elements
 
-# --- 修正函数 1：降低截图门槛，防止漏图 ---
-def capture_image_between_blocks(page, prev_bottom, current_top):
-    # ⬇️ 改动点：将 40 改为 10。论文排版很紧凑，间隙往往很小。
-    if current_top - prev_bottom < 10: return None 
+# --- 🔥 关键修改：区域截图函数 ---
+def capture_image_area(page, top, bottom):
+    # 高度太小（小于15px）忽略，可能是误判
+    if bottom - top < 15: return None
     
-    # ⬇️ 改动点：左右边距放宽 (50 -> 40)，上下边距收紧 (+2) 防止截到文字
-    rect = fitz.Rect(40, prev_bottom + 2, page.rect.width - 40, current_top - 2)
+    # 定义截图区域：左右留白 40，上下就是传入的坐标
+    rect = fitz.Rect(40, top, page.rect.width - 40, bottom)
     
     try:
-        # 提高分辨率 matrix=3 -> 4，让公式图更清晰
-        pix = page.get_pixmap(matrix=fitz.Matrix(4, 4), clip=rect, alpha=False)
-        
-        # ⬇️ 改动点：只要高度超过 10px 就认为是有效图片 (防止线条被过滤)
+        # matrix=3 保证清晰度
+        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=rect, alpha=False)
         if pix.height < 10 or pix.width < 10: return None
-        
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         return img
-    except: 
+    except:
         return None
 
-# --- 修正函数 2：修复页面顶部图片丢失的 BUG ---
+# --- 🔥 关键修改：锚点扫描逻辑 ---
 def parse_page(page):
     raw_elements = []
     blocks = page.get_text("blocks", sort=True)
     
-    # ⬇️ 改动点：默认起始高度设为 60 (避开页眉)，而不是 0
-    # 这样如果图片在第一段文字上面，也能被截取到
+    # 初始高度避开页眉 (设为 60)
     last_bottom = 60 
     
-    text_buffer = ""
+    # 过滤掉页眉页脚
     valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page.rect.height)]
     
     for i, b in enumerate(valid_blocks):
         b_rect = fitz.Rect(b[:4])
-        b_top = b_rect.y0
-        
-        # ❌ 删除这一行！它会导致第一段文字上方的图片无法被计算
-        # if i == 0 and last_bottom == 0: last_bottom = b_top 
+        current_top = b_rect.y0
+        current_bottom = b_rect.y1
+        text_content = b[4]
 
-        if is_caption_node(b[4]):
-            if text_buffer.strip():
-                raw_elements.append({'type': 'text', 'content': text_buffer})
-                text_buffer = ""
+        # === 核心逻辑：遇到图注，回头抓图 ===
+        if is_caption_node(text_content):
+            # 💡 发现图注！抓取 [上一段结尾] 到 [图注开头] 之间的区域
+            img = capture_image_area(page, last_bottom, current_top)
             
-            # 尝试捕获图片
-            img = capture_image_between_blocks(page, last_bottom, b_top)
-            if img: raw_elements.append({'type': 'image', 'content': img})
+            if img:
+                raw_elements.append({'type': 'image', 'content': img})
             
-            raw_elements.append({'type': 'caption', 'content': b[4]})
+            # 添加图注本身
+            raw_elements.append({'type': 'caption', 'content': text_content})
+            
+            # 更新 last_bottom 为图注的底部
+            last_bottom = current_bottom
+            
         else:
-            text_buffer += b[4] + "\n\n"
-        
-        last_bottom = b_rect.y1
-        
-    if text_buffer.strip():
-        raw_elements.append({'type': 'text', 'content': text_buffer})
-        
+            # === 兜底逻辑：防止无图注的巨型图片漏掉 ===
+            # 如果当前文字和上一段文字中间空隙极大 (>250px)，可能中间有个没图注的图
+            if current_top - last_bottom > 250:
+                img = capture_image_area(page, last_bottom, current_top)
+                if img: raw_elements.append({'type': 'image', 'content': img})
+
+            # 添加普通文本
+            if text_content.strip():
+                raw_elements.append({'type': 'text', 'content': text_content})
+            
+            last_bottom = current_bottom # 更新底边位置
+
     return batch_translate_elements(raw_elements)
 
 def get_page_image(page):
@@ -239,13 +277,11 @@ def get_page_image(page):
     img = Image.open(io.BytesIO(pix.tobytes("png")))
     return img
 
-def clean_latex(text):
-    return text.replace(r'\[', '$$').replace(r'\]', '$$').replace(r'\(', '$').replace(r'\)', '$')
-
-# --- 3. HTML 构建器 (接收排版参数) ---
+# ==========================================
+# 3. HTML 构建器
+# ==========================================
 def generate_html(doc, start, end, mode="pure", filename="Document", font_size=14, line_height=1.6, img_width=50):
     
-    # 动态生成 CSS
     dynamic_css = get_css(font_size, line_height, img_width)
     
     html_body = f'<div class="page-container">'
@@ -272,10 +308,13 @@ def generate_html(doc, start, end, mode="pure", filename="Document", font_size=1
                     for p in paras:
                         if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
                 elif el['type'] == 'caption':
-                    html_body += f'<div class="caption">图注: {el["content"]}</div>'
+                    html_body += f'<div class="caption">{el["content"]}</div>'
+                # 注意：对照模式下，右侧不重复显示通过 parse_page 抓取的小图，只显示整页截图
+            
             html_body += "</div></div>"
             
         else:
+            # 纯净模式
             page_els = parse_page(page)
             html_body += '<div class="pure-mode-container">'
             for el in page_els:
@@ -292,7 +331,9 @@ def generate_html(doc, start, end, mode="pure", filename="Document", font_size=1
     html_body += "</div>"
     return f"<!DOCTYPE html><html><head><meta charset='utf-8'>{dynamic_css}{MATHJAX_SCRIPT}</head><body>{html_body}</body></html>"
 
-# --- 4. PDF 引擎 ---
+# ==========================================
+# 4. PDF 引擎 (Chrome Headless)
+# ==========================================
 def get_chrome_path():
     if shutil.which("chromium"): return shutil.which("chromium")
     if shutil.which("chromium-browser"): return shutil.which("chromium-browser")
@@ -322,15 +363,19 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
     if platform.system() == "Linux": cmd.insert(1, "--no-sandbox")
 
     try:
+        # 🔥 修复：增加 stderr=subprocess.DEVNULL 屏蔽 DBus/OOM 报错
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True, "Success"
     except Exception as e:
         return False, str(e)
 
-# --- 5. 界面逻辑 ---
-st.title("🔬 光学室学术论文翻译专用版 (V37 排版大师)")
+# ==========================================
+# 5. 界面逻辑
+# ==========================================
+st.title("🔬 光学室学术论文翻译专用版 (V50 终极修复版)")
 
 with st.sidebar:
+    st.markdown("---")
     st.markdown("""
     <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #dcdcdc;">
         <h4 style="margin:0; color:#333;">👤 专属定制</h4>
@@ -343,11 +388,10 @@ with st.sidebar:
     uploaded_file = st.file_uploader("上传 PDF", type="pdf")
     
     st.markdown("---")
-    # === 新增排版控制区 ===
     with st.expander("🎨 排版设置 (防溢出)", expanded=True):
-        ui_font_size = st.slider("字体大小 (px)", 10, 18, 14, help="字太多时调小一点，推荐 12-14")
-        ui_line_height = st.slider("行间距 (Line Height)", 1.2, 2.0, 1.6, 0.1, help="越小越紧凑")
-        ui_img_width = st.slider("左图占比 (%)", 30, 70, 48, help="字多的时候，把图片占比调小，给文字腾地方")
+        ui_font_size = st.slider("字体大小 (px)", 10, 18, 14)
+        ui_line_height = st.slider("行间距", 1.2, 2.0, 1.6, 0.1)
+        ui_img_width = st.slider("左图占比 (%)", 30, 70, 48)
 
     st.markdown("---")
     app_mode = st.radio("功能模式", ["👁️ 实时预览", "🖨️ 导出 PDF"])
@@ -366,15 +410,14 @@ if uploaded_file:
                 st.session_state['run_preview'] = True
         
         if st.session_state.get('run_preview'):
-             with st.spinner("🚀 渲染预览中..."):
-                # 传入排版参数
+            with st.spinner("🚀 智能识别图片与文本中..."):
                 preview_html = generate_html(doc, page_num, page_num, mode="screenshot", 
                                              font_size=ui_font_size, 
                                              line_height=ui_line_height,
                                              img_width=ui_img_width)
                 components.html(preview_html, height=800, scrolling=True)
         else:
-             st.info("👈 点击“翻译此页”")
+            st.info("👈 点击“翻译此页”")
 
     else:
         st.subheader("📄 批量导出")
@@ -385,24 +428,26 @@ if uploaded_file:
         style_code = "screenshot" if "对照" in export_style else "pure"
         
         if st.button(f"🚀 生成 PDF", type="primary"):
-            bar = st.progress(0)
-            status = st.empty()
-            
-            status.text("正在并发翻译...")
-            # 传入排版参数
-            full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name,
-                                      font_size=ui_font_size,
-                                      line_height=ui_line_height,
-                                      img_width=ui_img_width)
-            
-            status.text("正在生成 PDF...")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-                ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
-                if ok:
-                    bar.progress(100)
-                    status.success("✅ 完成！")
-                    fname = "Translation_Custom.pdf"
-                    with open(tmp_pdf.name, "rb") as f:
-                        st.download_button("📥 下载文件", f, fname)
-                else:
-                    st.error(f"失败: {msg}")
+            if not client:
+                st.error("❌ 请先配置 API Key 才能导出！")
+            else:
+                bar = st.progress(0)
+                status = st.empty()
+                
+                status.text("正在并发翻译...")
+                full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name,
+                                          font_size=ui_font_size,
+                                          line_height=ui_line_height,
+                                          img_width=ui_img_width)
+                
+                status.text("正在调用 Chrome 生成 PDF...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                    ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
+                    if ok:
+                        bar.progress(100)
+                        status.success("✅ 完成！")
+                        fname = "Translation_Result.pdf"
+                        with open(tmp_pdf.name, "rb") as f:
+                            st.download_button("📥 下载 PDF", f, fname)
+                    else:
+                        st.error(f"生成失败: {msg}")
