@@ -16,23 +16,21 @@ import streamlit.components.v1 as components
 try:
     API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 except:
-    API_KEY = "sk-xxxxxxxx" # 本地测试请填入真实Key
+    API_KEY = "sk-xxxxxxxxxxxx" # 本地测试请填入真实Key
 
 BASE_URL = "https://api.deepseek.com"
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-# 1. 界面配置：网页标题依然叫“光学室专用版”，有排面！
 st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
 
-# --- 1. CSS 样式 (保持纯净学术风，解决方框乱码) ---
+# --- 1. CSS 样式 (新增双栏对照样式) ---
 COMMON_CSS = """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&family=Times+New+Roman&display=swap');
 
     body {
-        /* 优先使用宋体/衬线体，确保学术感 */
-        font-family: "Noto Serif SC", "Noto Sans CJK SC", "WenQuanYi Micro Hei", "SimSun", serif;
-        font-size: 16px;
+        font-family: "Noto Serif SC", "SimSun", serif;
+        font-size: 15px; /* 稍微调小一点以适应双栏 */
         line-height: 1.6;
         color: #000;
         margin: 0;
@@ -41,26 +39,54 @@ COMMON_CSS = """
     }
 
     .page-container {
-        max-width: 800px;
+        max-width: 900px; /* 变宽一点容纳双栏 */
         margin: 0 auto;
         padding: 40px;
         background-color: #fff;
+    }
+
+    /* === 纯净模式样式 === */
+    .pure-text p { margin-bottom: 1em; text-indent: 2em; text-align: justify; }
+
+    /* === 对照模式样式 (关键新增) === */
+    .bilingual-row {
+        display: flex;
+        flex-direction: row;
+        margin-bottom: 1.5em;
+        border-bottom: 1px solid #f0f0f0; /* 段落间加个淡线 */
+        padding-bottom: 1em;
+    }
+    
+    .col-eng {
+        flex: 1;
+        padding-right: 20px;
+        color: #555; /* 原文灰色，不抢眼 */
+        font-family: "Times New Roman", serif;
+        text-align: justify;
+        font-size: 14px;
+        border-right: 2px solid #eee; /* 中间加个分隔线 */
+    }
+    
+    .col-chn {
+        flex: 1;
+        padding-left: 20px;
+        color: #000; /* 译文黑色，重点突出 */
         text-align: justify;
     }
 
-    p { margin-bottom: 1em; text-indent: 2em; }
+    /* 图片统一样式 */
     img { max-width: 95%; display: block; margin: 20px auto; }
     
     .caption { 
-        font-size: 14px; color: #444; text-align: center; 
+        font-size: 13px; color: #444; text-align: center; 
         font-weight: bold; margin-bottom: 25px; font-family: sans-serif;
     }
 
-    /* 打印时完全隐藏分页标记 */
+    /* 分页控制 */
     .page-break { 
-        page-break-before: always; border-top: 1px dashed #eee; 
+        page-break-before: always; border-top: 1px dashed #ccc; 
         margin-top: 30px; padding-top: 10px; text-align: center; 
-        color: #ccc; font-size: 12px; 
+        color: #999; font-size: 12px; 
     }
     .page-break.first-page { page-break-before: avoid; display: none; }
     
@@ -77,7 +103,7 @@ MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache:
 <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 """
 
-# --- 2. 核心逻辑 (保持不变) ---
+# --- 2. 核心逻辑 (升级：同时保留原文和译文) ---
 def image_to_base64(pil_image):
     buff = io.BytesIO()
     pil_image.save(buff, format="PNG")
@@ -99,7 +125,7 @@ def translate_text(text, is_caption=False):
     【规则】
     1. 保持学术严谨性。
     2. 公式必须用 $...$ 或 $$...$$ 包裹。
-    3. 直接输出译文，不要加任何前缀或解释。
+    3. 直接输出译文，不要加任何前缀。
     """
     if is_caption: sys_prompt += " (这是图注，请保留 Figure 编号)"
     try:
@@ -120,6 +146,7 @@ def capture_image_between_blocks(page, prev_bottom, current_top):
         return img if img.size[1] >= 20 else None
     except: return None
 
+# V28 修改：parse_page 现在同时保存 original 和 translation
 def parse_page(page):
     elements = []
     blocks = page.get_text("blocks", sort=True)
@@ -133,26 +160,33 @@ def parse_page(page):
         if i == 0 and last_bottom == 0: last_bottom = b_top
 
         if is_caption_node(b[4]):
+            # 处理之前的文本块
             if text_buffer.strip():
-                elements.append({'type': 'text', 'content': translate_text(text_buffer)})
+                trans = translate_text(text_buffer)
+                elements.append({'type': 'text', 'original': text_buffer, 'translation': trans})
                 text_buffer = ""
+            
+            # 处理图片
             img = capture_image_between_blocks(page, last_bottom, b_top)
             if img: elements.append({'type': 'image', 'content': img})
-            elements.append({'type': 'caption', 'content': translate_text(b[4], True)})
+            
+            # 处理图注
+            caption_trans = translate_text(b[4], True)
+            elements.append({'type': 'caption', 'original': b[4], 'translation': caption_trans})
         else:
             text_buffer += b[4] + "\n\n"
         last_bottom = b_rect.y1
         
     if text_buffer.strip():
-        elements.append({'type': 'text', 'content': translate_text(text_buffer)})
+        trans = translate_text(text_buffer)
+        elements.append({'type': 'text', 'original': text_buffer, 'translation': trans})
     return elements
 
 def clean_latex(text):
     return text.replace(r'\[', '$$').replace(r'\]', '$$').replace(r'\(', '$').replace(r'\)', '$')
 
-# --- 3. HTML 构建器 (关键：这里不加封面，保持纯净) ---
-def generate_full_html(all_pages_data, filename="Document"):
-    # 纯净版 PDF：不加任何“白水制作”的 Header
+# --- 3. HTML 构建器 (双模式逻辑) ---
+def generate_html(all_pages_data, mode="pure", filename="Doc"):
     html_body = f'<div class="page-container">'
     
     for idx, page_els in enumerate(all_pages_data):
@@ -160,15 +194,43 @@ def generate_full_html(all_pages_data, filename="Document"):
         html_body += f'<div class="{page_class}">- {idx+1} -</div>'
         
         for el in page_els:
-            if el['type'] == 'text':
-                paras = clean_latex(el['content']).split('\n\n')
-                for p in paras:
-                    if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
-            elif el['type'] == 'image':
+            if el['type'] == 'image':
+                # 图片始终居中显示
                 html_body += f'<img src="{image_to_base64(el["content"])}" />'
+            
             elif el['type'] == 'caption':
-                html_body += f'<div class="caption">{el["content"]}</div>'
-                
+                # 图注
+                if mode == "bilingual":
+                    html_body += f"""
+                    <div class="caption">
+                        <span style="color:#666; font-size:0.9em;">[原文] {el['original']}</span><br>
+                        <span>{el['translation']}</span>
+                    </div>
+                    """
+                else:
+                    html_body += f'<div class="caption">{el["translation"]}</div>'
+            
+            elif el['type'] == 'text':
+                # 正文
+                if mode == "bilingual":
+                    # --- 双栏对照布局 ---
+                    orig = clean_latex(el['original']).replace('\n', '<br>')
+                    trans = clean_latex(el['translation']).replace('\n\n', '</p><p>')
+                    
+                    html_body += f"""
+                    <div class="bilingual-row">
+                        <div class="col-eng">{orig}</div>
+                        <div class="col-chn"><p>{trans}</p></div>
+                    </div>
+                    """
+                else:
+                    # --- 纯净翻译布局 ---
+                    paras = clean_latex(el['translation']).split('\n\n')
+                    html_body += '<div class="pure-text">'
+                    for p in paras:
+                        if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
+                    html_body += '</div>'
+
     html_body += "</div>"
     return f"<!DOCTYPE html><html><head><meta charset='utf-8'>{COMMON_CSS}{MATHJAX_SCRIPT}</head><body>{html_body}</body></html>"
 
@@ -176,7 +238,6 @@ def generate_full_html(all_pages_data, filename="Document"):
 def get_chrome_path():
     if shutil.which("chromium"): return shutil.which("chromium")
     if shutil.which("chromium-browser"): return shutil.which("chromium-browser")
-    # Mac/Win paths...
     mac_paths = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
     for p in mac_paths: 
         if os.path.exists(p): return p
@@ -209,12 +270,10 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
     except Exception as e:
         return False, str(e)
 
-# --- 5. 界面逻辑 (关键：这里恢复你的名字！) ---
-# 界面大标题：保留“光学室专用版”
+# --- 5. 界面逻辑 ---
 st.title("🔬 光学室学术论文翻译专用版")
 
 with st.sidebar:
-    # 👇👇👇 恢复了这个漂亮的个人名片！👇👇👇
     st.markdown("""
     <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #dcdcdc;">
         <h4 style="margin:0; color:#333;">👤 专属定制</h4>
@@ -224,17 +283,27 @@ with st.sidebar:
         </p>
     </div>
     """, unsafe_allow_html=True)
-    # 👆👆👆 只有网页上看得到，PDF 里不会有！👆👆👆
     
     uploaded_file = st.file_uploader("上传 PDF", type="pdf")
     st.markdown("---")
-    mode = st.radio("功能模式", ["👁️ 实时预览", "🖨️ 导出 PDF"])
+    
+    # 模式选择
+    app_mode = st.radio("功能模式", ["👁️ 实时预览", "🖨️ 导出 PDF"])
+    
+    # 新增：导出格式选择
+    if app_mode == "🖨️ 导出 PDF":
+        st.markdown("##### 📄 导出格式")
+        export_style = st.radio(
+            "选择排版风格：",
+            ["纯净译文版 (仅中文)", "中英对照版 (左英右中)"],
+            index=0
+        )
 
 if uploaded_file:
     pdf_bytes = uploaded_file.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     
-    if mode == "👁️ 实时预览":
+    if app_mode == "👁️ 实时预览":
         with st.sidebar:
             st.markdown("---")
             page_num = st.number_input("页码", 1, len(doc), 1)
@@ -251,16 +320,20 @@ if uploaded_file:
             if st.session_state.get('run_preview'):
                 with st.spinner("AI 解析中..."):
                     els = parse_page(doc[page_num-1])
-                    preview_html = generate_full_html([els])
+                    # 预览强制使用纯净版，因为左边已经有原文图片了
+                    preview_html = generate_html([els], mode="pure")
                     components.html(preview_html, height=800, scrolling=True)
 
-    else:
-        st.subheader("📄 批量导出 (纯净版)")
+    else: # 导出模式
+        st.subheader("📄 批量导出")
         c1, c2 = st.columns(2)
         with c1: start = st.number_input("起始页", 1, len(doc), 1)
         with c2: end = st.number_input("结束页", 1, len(doc), min(3, len(doc)))
         
-        if st.button("🚀 生成 PDF", type="primary"):
+        # 映射用户选择到代码逻辑
+        style_code = "bilingual" if "对照" in export_style else "pure"
+        
+        if st.button(f"🚀 生成 PDF ({export_style})", type="primary"):
             data = []
             bar = st.progress(0)
             status = st.empty()
@@ -270,14 +343,15 @@ if uploaded_file:
                 data.append(parse_page(doc[p-1]))
                 bar.progress((i+1) / (end-start+1))
             
-            status.text("正在合成纯净文档...")
-            full_html = generate_full_html(data, filename=uploaded_file.name)
+            status.text("正在排版...")
+            full_html = generate_html(data, mode=style_code, filename=uploaded_file.name)
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
                 ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
                 if ok:
                     status.success("✅ 完成！")
+                    fname = "Translation_Bilingual.pdf" if style_code == "bilingual" else "Translation_Pure.pdf"
                     with open(tmp_pdf.name, "rb") as f:
-                        st.download_button("📥 下载翻译报告", f, "Translated_Paper.pdf")
+                        st.download_button("📥 下载 PDF 文件", f, fname)
                 else:
                     st.error(f"失败: {msg}")
