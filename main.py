@@ -24,90 +24,99 @@ client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
 
-# --- 1. CSS 样式 (V36: 强制横向 + 安全边距) ---
-COMMON_CSS = """
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&display=swap');
-
-    /* === 核心修复：打印页面设置 === */
-    @page {
-        size: A4 landscape; /* 强制横向 A4 */
-        margin: 15mm;       /* 关键：留出 1.5cm 的安全边距，防止切边 */
-    }
-
-    body {
-        font-family: "Noto Serif SC", "SimSun", serif;
-        font-size: 14px; /* 横向排版，字体可以稍微精细一点 */
-        line-height: 1.6;
-        color: #111;
-        margin: 0;
-        padding: 0;
-        background-color: white;
-    }
-
-    .page-container {
-        width: 100%;
-        /* max-width: 1200px;  <-- 删掉这个限制，让它自适应横向纸张 */
-        margin: 0 auto;
-        padding: 0; /* padding 交给 @page 管理 */
-    }
-
-    /* === 左右对照布局 === */
-    .split-layout {
-        display: flex;
-        flex-direction: row;
-        gap: 30px; /* 增加间距，因为横向空间大 */
-        margin-bottom: 30px;
-        align-items: flex-start;
-        border-bottom: 1px dashed #ccc;
-        padding-bottom: 30px;
-        page-break-inside: avoid; /* 尽量不要把一组对照切断 */
-    }
-
-    .left-col-image {
-        width: 48%; /* 稍微留点余地，不要占满 50% */
-        flex-shrink: 0;
-        border: 1px solid #ddd;
-        box-shadow: 2px 2px 8px rgba(0,0,0,0.1);
-        border-radius: 4px;
-        overflow: hidden; /* 防止图片溢出框 */
-    }
+# --- 1. CSS 生成器 (V37: 动态注入排版参数) ---
+def get_css(font_size, line_height, img_width_pct):
+    text_width_pct = 100 - img_width_pct - 2 # 预留2%间隙
     
-    .left-col-image img {
-        width: 100%;
-        height: auto;
-        display: block;
-    }
+    return f"""
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&display=swap');
 
-    .right-col-text {
-        width: 52%; /* 文字部分稍微宽一点点 */
-        padding-left: 10px;
-        text-align: justify;
-    }
+        @page {{
+            size: A4 landscape;
+            margin: 15mm; 
+        }}
 
-    /* === 纯净模式样式 === */
-    .pure-mode-container {
-        max-width: 900px; /* 纯净模式还是回到中间比较好看 */
-        margin: 0 auto;
-    }
-    .pure-mode-container p { margin-bottom: 1em; text-indent: 2em; }
-    .pure-mode-container img { max-width: 80%; display: block; margin: 20px auto; }
+        body {{
+            font-family: "Noto Serif SC", "SimSun", serif;
+            font-size: {font_size}px;  /* 动态字号 */
+            line-height: {line_height}; /* 动态行高 */
+            color: #111;
+            margin: 0;
+            padding: 0;
+            background-color: white;
+        }}
 
-    .caption { font-size: 13px; color: #555; text-align: center; font-weight: bold; margin-bottom: 20px; font-family: sans-serif;}
+        .page-container {{
+            width: 100%;
+            margin: 0 auto;
+        }}
 
-    .page-marker {
-        text-align: center; font-size: 12px; color: #aaa; 
-        margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 5px;
-    }
-    .page-break { page-break-before: always; }
-    .page-break.first-page { page-break-before: avoid; }
-    
-    @media print { 
-        /* 打印时隐藏不必要的元素 */
-        .page-break { height: 0; margin: 0; }
-    }
-</style>
-"""
+        /* === 左右对照布局 (动态宽度) === */
+        .split-layout {{
+            display: flex;
+            flex-direction: row;
+            gap: 20px;
+            margin-bottom: 30px;
+            align-items: flex-start;
+            border-bottom: 1px dashed #ccc;
+            padding-bottom: 30px;
+            page-break-inside: avoid;
+        }}
+
+        .left-col-image {{
+            width: {img_width_pct}%;  /* 动态图片列宽 */
+            flex-shrink: 0;
+            border: 1px solid #ddd;
+            box-shadow: 2px 2px 8px rgba(0,0,0,0.1);
+            border-radius: 4px;
+            overflow: hidden;
+        }}
+        
+        .left-col-image img {{
+            width: 100%;
+            height: auto;
+            display: block;
+        }}
+
+        .right-col-text {{
+            width: {text_width_pct}%; /* 动态文字列宽 */
+            padding-left: 5px;
+            text-align: justify;
+            overflow-wrap: break-word; /* 防止长单词撑破 */
+        }}
+        
+        /* 针对公式的微调 */
+        .MathJax {{
+            font-size: 100% !important; /* 跟随正文字号 */
+        }}
+
+        /* === 纯净模式 === */
+        .pure-mode-container {{
+            max-width: 900px;
+            margin: 0 auto;
+        }}
+        .pure-mode-container p {{ margin-bottom: 1em; text-indent: 2em; }}
+        .pure-mode-container img {{ max-width: 80%; display: block; margin: 20px auto; }}
+
+        .caption {{ 
+            font-size: {font_size - 2}px; /* 图注比正文小一点 */
+            color: #555; 
+            text-align: center; 
+            font-weight: bold; 
+            margin-bottom: 15px; 
+            font-family: sans-serif;
+        }}
+
+        .page-marker {{
+            text-align: center; font-size: 12px; color: #aaa; 
+            margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 5px;
+        }}
+        .page-break {{ page-break-before: always; }}
+        .page-break.first-page {{ page-break-before: avoid; }}
+        @media print {{ .page-break {{ height: 0; margin: 0; }} }}
+    </style>
+    """
 
 MATHJAX_SCRIPT = """
 <script>
@@ -116,7 +125,7 @@ MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache:
 <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 """
 
-# --- 2. 核心逻辑 (保持 V35 的并发极速版) ---
+# --- 2. 核心逻辑 (保持并发极速版) ---
 
 def image_to_base64(pil_image):
     buff = io.BytesIO()
@@ -149,7 +158,6 @@ def translate_text(text, is_caption=False):
         return response.choices[0].message.content
     except: return text
 
-# 并发翻译
 def batch_translate_elements(elements):
     tasks = []
     indices = []
@@ -160,7 +168,6 @@ def batch_translate_elements(elements):
     
     if not tasks: return elements
 
-    # 5线程并发
     with ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(lambda p: translate_text(p[0], p[1]), tasks))
     
@@ -206,7 +213,6 @@ def parse_page(page):
     return batch_translate_elements(raw_elements)
 
 def get_page_image(page):
-    # 稍微降低一点点分辨率以提高速度，matrix=2 足够清晰了
     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
     img = Image.open(io.BytesIO(pix.tobytes("png")))
     return img
@@ -214,21 +220,20 @@ def get_page_image(page):
 def clean_latex(text):
     return text.replace(r'\[', '$$').replace(r'\]', '$$').replace(r'\(', '$').replace(r'\)', '$')
 
-# --- 3. HTML 构建器 ---
-def generate_html(doc, start, end, mode="pure", filename="Document"):
+# --- 3. HTML 构建器 (接收排版参数) ---
+def generate_html(doc, start, end, mode="pure", filename="Document", font_size=14, line_height=1.6, img_width=50):
+    
+    # 动态生成 CSS
+    dynamic_css = get_css(font_size, line_height, img_width)
+    
     html_body = f'<div class="page-container">'
     
     for page_num in range(start, end + 1):
         page = doc[page_num-1]
-        
-        # 分页标记
         marker_class = "page-break first-page" if page_num == start else "page-break"
         html_body += f'<div class="{marker_class}"><div class="page-marker">- 第 {page_num} 页 -</div></div>'
         
         if mode == "screenshot":
-            # === 左图右文 (截图模式) ===
-            # 这里不需要 translate 整个 page 的 text，只需要右边的 text
-            # 为了简单复用，我们还是调 parse_page，虽然它会提取一些小图，但我们在截图模式下不显示小图
             page_els = parse_page(page) 
             img_b64 = image_to_base64(get_page_image(page))
             
@@ -249,9 +254,6 @@ def generate_html(doc, start, end, mode="pure", filename="Document"):
             html_body += "</div></div>"
             
         else:
-            # === 纯净模式 ===
-            # 纯净模式下，我们希望它是纵向的，所以这里用 CSS override 一下 @page 可能会比较复杂
-            # 简单起见，我们在 html_body 里包一层
             page_els = parse_page(page)
             html_body += '<div class="pure-mode-container">'
             for el in page_els:
@@ -266,7 +268,7 @@ def generate_html(doc, start, end, mode="pure", filename="Document"):
             html_body += '</div>'
                 
     html_body += "</div>"
-    return f"<!DOCTYPE html><html><head><meta charset='utf-8'>{COMMON_CSS}{MATHJAX_SCRIPT}</head><body>{html_body}</body></html>"
+    return f"<!DOCTYPE html><html><head><meta charset='utf-8'>{dynamic_css}{MATHJAX_SCRIPT}</head><body>{html_body}</body></html>"
 
 # --- 4. PDF 引擎 ---
 def get_chrome_path():
@@ -304,7 +306,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         return False, str(e)
 
 # --- 5. 界面逻辑 ---
-st.title("🔬 光学室学术论文翻译专用版 (防切边修复版)")
+st.title("🔬 光学室学术论文翻译专用版 (V37 排版大师)")
 
 with st.sidebar:
     st.markdown("""
@@ -317,11 +319,18 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
     uploaded_file = st.file_uploader("上传 PDF", type="pdf")
+    
+    st.markdown("---")
+    # === 新增排版控制区 ===
+    with st.expander("🎨 排版设置 (防溢出)", expanded=True):
+        ui_font_size = st.slider("字体大小 (px)", 10, 18, 14, help="字太多时调小一点，推荐 12-14")
+        ui_line_height = st.slider("行间距 (Line Height)", 1.2, 2.0, 1.6, 0.1, help="越小越紧凑")
+        ui_img_width = st.slider("左图占比 (%)", 30, 70, 48, help="字多的时候，把图片占比调小，给文字腾地方")
+
     st.markdown("---")
     app_mode = st.radio("功能模式", ["👁️ 实时预览", "🖨️ 导出 PDF"])
     if app_mode == "🖨️ 导出 PDF":
-        st.markdown("##### 📄 导出格式")
-        export_style = st.radio("选择风格：", ["纯净译文版 (V27经典)", "中英对照版 (左图右文)"], index=1) # 默认选中对照
+        export_style = st.radio("导出风格：", ["纯净译文版", "中英对照版 (左图右文)"], index=1)
 
 if uploaded_file:
     pdf_bytes = uploaded_file.read()
@@ -335,8 +344,12 @@ if uploaded_file:
                 st.session_state['run_preview'] = True
         
         if st.session_state.get('run_preview'):
-             with st.spinner("🚀 极速解析中..."):
-                preview_html = generate_html(doc, page_num, page_num, mode="screenshot")
+             with st.spinner("🚀 渲染预览中..."):
+                # 传入排版参数
+                preview_html = generate_html(doc, page_num, page_num, mode="screenshot", 
+                                             font_size=ui_font_size, 
+                                             line_height=ui_line_height,
+                                             img_width=ui_img_width)
                 components.html(preview_html, height=800, scrolling=True)
         else:
              st.info("👈 点击“翻译此页”")
@@ -349,20 +362,24 @@ if uploaded_file:
         
         style_code = "screenshot" if "对照" in export_style else "pure"
         
-        if st.button(f"🚀 生成防切边 PDF", type="primary"):
+        if st.button(f"🚀 生成 PDF", type="primary"):
             bar = st.progress(0)
             status = st.empty()
             
             status.text("正在并发翻译...")
-            full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name)
+            # 传入排版参数
+            full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name,
+                                      font_size=ui_font_size,
+                                      line_height=ui_line_height,
+                                      img_width=ui_img_width)
             
-            status.text("正在生成 PDF (已强制横向)...")
+            status.text("正在生成 PDF...")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
                 ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
                 if ok:
                     bar.progress(100)
                     status.success("✅ 完成！")
-                    fname = "Translation_Landscape.pdf" if style_code == "screenshot" else "Translation_Pure.pdf"
+                    fname = "Translation_Custom.pdf"
                     with open(tmp_pdf.name, "rb") as f:
                         st.download_button("📥 下载文件", f, fname)
                 else:
