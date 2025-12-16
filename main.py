@@ -24,9 +24,9 @@ client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
 
-# --- 1. CSS 生成器 (V37: 动态注入排版参数) ---
+# --- 1. CSS 生成器 ---
 def get_css(font_size, line_height, img_width_pct):
-    text_width_pct = 100 - img_width_pct - 2 # 预留2%间隙
+    text_width_pct = 100 - img_width_pct - 2 
     
     return f"""
     <style>
@@ -39,8 +39,8 @@ def get_css(font_size, line_height, img_width_pct):
 
         body {{
             font-family: "Noto Serif SC", "SimSun", serif;
-            font-size: {font_size}px;  /* 动态字号 */
-            line-height: {line_height}; /* 动态行高 */
+            font-size: {font_size}px;
+            line-height: {line_height};
             color: #111;
             margin: 0;
             padding: 0;
@@ -52,7 +52,7 @@ def get_css(font_size, line_height, img_width_pct):
             margin: 0 auto;
         }}
 
-        /* === 左右对照布局 (动态宽度) === */
+        /* 左右对照布局 */
         .split-layout {{
             display: flex;
             flex-direction: row;
@@ -65,7 +65,7 @@ def get_css(font_size, line_height, img_width_pct):
         }}
 
         .left-col-image {{
-            width: {img_width_pct}%;  /* 动态图片列宽 */
+            width: {img_width_pct}%;
             flex-shrink: 0;
             border: 1px solid #ddd;
             box-shadow: 2px 2px 8px rgba(0,0,0,0.1);
@@ -80,27 +80,21 @@ def get_css(font_size, line_height, img_width_pct):
         }}
 
         .right-col-text {{
-            width: {text_width_pct}%; /* 动态文字列宽 */
+            width: {text_width_pct}%;
             padding-left: 5px;
             text-align: justify;
-            overflow-wrap: break-word; /* 防止长单词撑破 */
+            overflow-wrap: break-word;
         }}
         
-        /* 针对公式的微调 */
-        .MathJax {{
-            font-size: 100% !important; /* 跟随正文字号 */
-        }}
+        .MathJax {{ font-size: 100% !important; }}
 
-        /* === 纯净模式 === */
-        .pure-mode-container {{
-            max-width: 900px;
-            margin: 0 auto;
-        }}
+        /* 纯净模式 */
+        .pure-mode-container {{ max-width: 900px; margin: 0 auto; }}
         .pure-mode-container p {{ margin-bottom: 1em; text-indent: 2em; }}
         .pure-mode-container img {{ max-width: 80%; display: block; margin: 20px auto; }}
 
         .caption {{ 
-            font-size: {font_size - 2}px; /* 图注比正文小一点 */
+            font-size: {font_size - 2}px;
             color: #555; 
             text-align: center; 
             font-weight: bold; 
@@ -125,7 +119,7 @@ MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache:
 <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 """
 
-# --- 2. 核心逻辑 (保持并发极速版) ---
+# --- 2. 核心逻辑 ---
 
 def image_to_base64(pil_image):
     buff = io.BytesIO()
@@ -176,35 +170,48 @@ def batch_translate_elements(elements):
     return elements
 
 def capture_image_between_blocks(page, prev_bottom, current_top):
-    if current_top - prev_bottom < 40: return None
-    rect = fitz.Rect(50, prev_bottom + 5, page.rect.width - 50, current_top - 5)
+    if current_top - prev_bottom < 30: return None # 稍微放宽一点限制
+    # rect 的起始点 prev_bottom 必须考虑到页眉，不能太小
+    safe_top = max(prev_bottom + 5, 40) # 确保不抓到页眉
+    rect = fitz.Rect(50, safe_top, page.rect.width - 50, current_top - 5)
     try:
         pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=rect, alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         return img if img.size[1] >= 20 else None
     except: return None
 
+# --- V38 修复核心：parse_page ---
 def parse_page(page):
     raw_elements = []
     blocks = page.get_text("blocks", sort=True)
-    last_bottom = 0
+    
+    # 关键修改 1：初始化为 50 (避开页眉)，而不是 0
+    # 这样如果第一个块是图注(位置200)，它会去扫描 50~200 之间的区域
+    last_bottom = 50 
+    
     text_buffer = ""
     valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page.rect.height)]
     
     for i, b in enumerate(valid_blocks):
         b_rect = fitz.Rect(b[:4])
         b_top = b_rect.y0
-        if i == 0 and last_bottom == 0: last_bottom = b_top
+        
+        # 关键修改 2：删除了 "if i==0... last_bottom=b_top" 这行代码
+        # 这样就不会跳过页面顶部的图片了
 
         if is_caption_node(b[4]):
             if text_buffer.strip():
                 raw_elements.append({'type': 'text', 'content': text_buffer})
                 text_buffer = ""
+            
+            # 抓取当前图注上方的区域
             img = capture_image_between_blocks(page, last_bottom, b_top)
             if img: raw_elements.append({'type': 'image', 'content': img})
+            
             raw_elements.append({'type': 'caption', 'content': b[4]})
         else:
             text_buffer += b[4] + "\n\n"
+        
         last_bottom = b_rect.y1
         
     if text_buffer.strip():
@@ -220,12 +227,9 @@ def get_page_image(page):
 def clean_latex(text):
     return text.replace(r'\[', '$$').replace(r'\]', '$$').replace(r'\(', '$').replace(r'\)', '$')
 
-# --- 3. HTML 构建器 (接收排版参数) ---
+# --- 3. HTML 构建器 ---
 def generate_html(doc, start, end, mode="pure", filename="Document", font_size=14, line_height=1.6, img_width=50):
-    
-    # 动态生成 CSS
     dynamic_css = get_css(font_size, line_height, img_width)
-    
     html_body = f'<div class="page-container">'
     
     for page_num in range(start, end + 1):
@@ -239,9 +243,7 @@ def generate_html(doc, start, end, mode="pure", filename="Document", font_size=1
             
             html_body += f"""
             <div class="split-layout">
-                <div class="left-col-image">
-                    <img src="{img_b64}" />
-                </div>
+                <div class="left-col-image"><img src="{img_b64}" /></div>
                 <div class="right-col-text">
             """
             for el in page_els:
@@ -306,7 +308,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         return False, str(e)
 
 # --- 5. 界面逻辑 ---
-st.title("🔬 光学室学术论文翻译专用版 (V37 排版大师)")
+st.title("🔬 光学室学术论文翻译专用版 (V38 顶部图修复)")
 
 with st.sidebar:
     st.markdown("""
@@ -321,11 +323,10 @@ with st.sidebar:
     uploaded_file = st.file_uploader("上传 PDF", type="pdf")
     
     st.markdown("---")
-    # === 新增排版控制区 ===
     with st.expander("🎨 排版设置 (防溢出)", expanded=True):
-        ui_font_size = st.slider("字体大小 (px)", 10, 18, 14, help="字太多时调小一点，推荐 12-14")
-        ui_line_height = st.slider("行间距 (Line Height)", 1.2, 2.0, 1.6, 0.1, help="越小越紧凑")
-        ui_img_width = st.slider("左图占比 (%)", 30, 70, 48, help="字多的时候，把图片占比调小，给文字腾地方")
+        ui_font_size = st.slider("字体大小 (px)", 10, 18, 14)
+        ui_line_height = st.slider("行间距", 1.2, 2.0, 1.6, 0.1)
+        ui_img_width = st.slider("左图占比 (%)", 30, 70, 48)
 
     st.markdown("---")
     app_mode = st.radio("功能模式", ["👁️ 实时预览", "🖨️ 导出 PDF"])
@@ -345,7 +346,6 @@ if uploaded_file:
         
         if st.session_state.get('run_preview'):
              with st.spinner("🚀 渲染预览中..."):
-                # 传入排版参数
                 preview_html = generate_html(doc, page_num, page_num, mode="screenshot", 
                                              font_size=ui_font_size, 
                                              line_height=ui_line_height,
@@ -367,7 +367,6 @@ if uploaded_file:
             status = st.empty()
             
             status.text("正在并发翻译...")
-            # 传入排版参数
             full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name,
                                       font_size=ui_font_size,
                                       line_height=ui_line_height,
@@ -379,7 +378,7 @@ if uploaded_file:
                 if ok:
                     bar.progress(100)
                     status.success("✅ 完成！")
-                    fname = "Translation_Custom.pdf"
+                    fname = "Translation_FixTop.pdf"
                     with open(tmp_pdf.name, "rb") as f:
                         st.download_button("📥 下载文件", f, fname)
                 else:
