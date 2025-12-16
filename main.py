@@ -337,4 +337,311 @@ def extract_image_blocks(page):
                     "bbox": fitz.Rect(x0, y0, x1, y1),
                     "used": False
                 })
-    img_blocks.sort(key=lambda it: it["bbox"].y0)_
+    img_blocks.sort(key=lambda it: it["bbox"].y0)
+    return img_blocks
+
+def clip_rect_to_image(page, rect, zoom=2.5):
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect, alpha=False)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        return img
+    except Exception:
+        return None
+
+def find_best_image_for_caption(img_blocks, cap_rect, page_rect):
+    """
+    给定图注矩形 cap_rect，找一个最合理的图片块：
+    - 优先找 cap 上方、距离最近、横向重叠较多的图
+    - 上方找不到再找下方
+    """
+    def x_overlap(a, b):
+        inter = max(0, min(a.x1, b.x1) - max(a.x0, b.x0))
+        return inter / max(1, min(a.width, b.width))
+
+    best = None
+    best_score = -1
+
+    # 上方优先
+    for it in img_blocks:
+        if it["used"]:
+            continue
+        r = it["bbox"]
+        if r.y1 <= cap_rect.y0 + 5:
+            dist = cap_rect.y0 - r.y1
+            if dist > page_rect.height * 0.35:
+                continue
+            overlap = x_overlap(r, cap_rect)
+            score = overlap * 2.0 - dist / 800.0
+            if score > best_score:
+                best_score, best = score, it
+
+    # 下方兜底
+    if best is None:
+        for it in img_blocks:
+            if it["used"]:
+                continue
+            r = it["bbox"]
+            if r.y0 >= cap_rect.y1 - 5:
+                dist = r.y0 - cap_rect.y1
+                if dist > page_rect.height * 0.35:
+                    continue
+                overlap = x_overlap(r, cap_rect)
+                score = overlap * 2.0 - dist / 800.0
+                if score > best_score:
+                    best_score, best = score, it
+
+    return best
+
+# ============================================================
+# 5) parse_page：抽图 + 图注配对 + 文本翻译
+# ============================================================
+
+def parse_page(page):
+    raw_elements = []
+    blocks = page.get_text("blocks", sort=True)
+    page_h = page.rect.height
+
+    valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page_h)]
+
+    # 先提取本页真正的图片块
+    img_blocks = extract_image_blocks(page)
+
+    text_buffer = ""
+
+    for b in valid_blocks:
+        b_rect = fitz.Rect(b[:4])
+        content = b[4] if len(b) > 4 else ""
+
+        if is_caption_node(content):
+            if text_buffer.strip():
+                raw_elements.append({'type': 'text', 'content': text_buffer})
+                text_buffer = ""
+
+            best = find_best_image_for_caption(img_blocks, b_rect, page.rect)
+            if best is not None:
+                best["used"] = True
+                img = clip_rect_to_image(page, best["bbox"], zoom=2.5)
+                if img:
+                    raw_elements.append({'type': 'image', 'content': img})
+
+            raw_elements.append({'type': 'caption', 'content': content})
+        else:
+            text_buffer += str(content) + "\n\n"
+
+    if text_buffer.strip():
+        raw_elements.append({'type': 'text', 'content': text_buffer})
+
+    return batch_translate_elements(raw_elements, max_workers=4)
+
+def get_page_image(page):
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    return img
+
+# ============================================================
+# 6) HTML 构建器
+# ============================================================
+
+def generate_html(doc, start, end, mode="pure", filename="Document", font_size=14, line_height=1.6, img_width=50):
+    dynamic_css = get_css(font_size, line_height, img_width)
+    html_body = f'<div class="page-container">'
+
+    for page_num in range(start, end + 1):
+        page = doc[page_num - 1]
+        marker_class = "page-break first-page" if page_num == start else "page-break"
+        html_body += f'<div class="{marker_class}"><div class="page-marker">- 第 {page_num} 页 -</div></div>'
+
+        page_els = parse_page(page)
+
+        if mode == "screenshot":
+            # 对照版：左边整页截图最稳，右边展示译文/图注
+            img_b64 = image_to_base64(get_page_image(page), fmt="JPEG", jpeg_quality=85)
+
+            html_body += f"""
+            <div class="split-layout">
+                <div class="left-col-image"><img src="{img_b64}" /></div>
+                <div class="right-col-text">
+            """
+            for el in page_els:
+                if el['type'] == 'text':
+                    paras = clean_latex(el['content']).split('\n\n')
+                    for p in paras:
+                        p = (p or "").strip()
+                        if p:
+                            html_body += f"<p>{p.replace('**', '')}</p>"
+                elif el['type'] == 'caption':
+                    html_body += f'<div class="caption">图注: {el["content"]}</div>'
+            html_body += "</div></div>"
+
+        else:
+            # 纯净译文版：会把抽出来的图插入正文（按图注配对）
+            html_body += '<div class="pure-mode-container">'
+            for el in page_els:
+                if el['type'] == 'text':
+                    paras = clean_latex(el['content']).split('\n\n')
+                    for p in paras:
+                        p = (p or "").strip()
+                        if p:
+                            html_body += f"<p>{p.replace('**', '')}</p>"
+                elif el['type'] == 'image':
+                    html_body += f'<img src="{image_to_base64(el["content"], fmt="JPEG", jpeg_quality=85)}" />'
+                elif el['type'] == 'caption':
+                    html_body += f'<div class="caption">{el["content"]}</div>'
+            html_body += '</div>'
+
+    html_body += "</div>"
+    return f"<!DOCTYPE html><html><head><meta charset='utf-8'>{dynamic_css}{MATHJAX_SCRIPT}</head><body>{html_body}</body></html>"
+
+# ============================================================
+# 7) PDF 导出引擎
+# ============================================================
+
+def get_chrome_path():
+    if shutil.which("chromium"):
+        return shutil.which("chromium")
+    if shutil.which("chromium-browser"):
+        return shutil.which("chromium-browser")
+
+    mac_paths = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    for p in mac_paths:
+        if os.path.exists(p):
+            return p
+
+    win_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    ]
+    for p in win_paths:
+        if os.path.exists(p):
+            return p
+
+    return None
+
+def html_to_pdf_with_chrome(html_content, output_pdf_path):
+    chrome_bin = get_chrome_path()
+    if not chrome_bin:
+        return False, "❌ 未找到 Chrome/Chromium（导出 PDF 需要浏览器核心）"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as tmp_html:
+        tmp_html.write(html_content)
+        tmp_html_path = tmp_html.name
+
+    cmd = [
+        chrome_bin, "--headless", "--disable-gpu",
+        f"--print-to-pdf={output_pdf_path}",
+        "--no-pdf-header-footer",
+        "--virtual-time-budget=7000",
+        f"file://{tmp_html_path}"
+    ]
+    if platform.system() == "Linux":
+        cmd.insert(1, "--no-sandbox")
+
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return True, "Success"
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b"").decode("utf-8", errors="ignore")
+        return False, f"Chrome 导出失败：{err[:800]}"
+    except Exception as e:
+        return False, str(e)
+
+# ============================================================
+# 8) 界面逻辑
+# ============================================================
+
+st.title("🔬 光学室学术论文翻译专用版 (V40 图识别增强版)")
+
+with st.sidebar:
+    st.markdown("""
+    <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #dcdcdc;">
+        <h4 style="margin:0; color:#333;">👤 专属定制</h4>
+        <p style="margin:5px 0 0 0; font-size:14px; color:#555;">
+        <strong>制作人：</strong> 白水<br>
+        <strong>微信：</strong> <code style="background:white;">guo21615</code>
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    uploaded_file = st.file_uploader("上传 PDF", type="pdf")
+
+    st.markdown("---")
+    with st.expander("🎨 排版设置 (防溢出)", expanded=True):
+        ui_font_size = st.slider("字体大小 (px)", 10, 18, 14)
+        ui_line_height = st.slider("行间距", 1.2, 2.0, 1.6, 0.1)
+        ui_img_width = st.slider("左图占比 (%)", 30, 70, 48)
+
+    st.markdown("---")
+    app_mode = st.radio("功能模式", ["👁️ 实时预览", "🖨️ 导出 PDF"])
+    if app_mode == "🖨️ 导出 PDF":
+        export_style = st.radio("导出风格：", ["纯净译文版", "中英对照版 (左图右文)"], index=1)
+
+    st.markdown("---")
+    if st.session_state.get("translate_errors"):
+        with st.expander(f"⚠️ 翻译错误日志（{len(st.session_state['translate_errors'])}）", expanded=False):
+            for i, e in enumerate(st.session_state["translate_errors"][-20:], 1):
+                st.write(f"{i}. {e}")
+
+if uploaded_file:
+    pdf_bytes = uploaded_file.read()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    if app_mode == "👁️ 实时预览":
+        with st.sidebar:
+            st.markdown("---")
+            page_num = st.number_input("页码", 1, len(doc), 1)
+            if st.button("🔄 翻译此页", type="primary"):
+                st.session_state['run_preview'] = True
+
+        if st.session_state.get('run_preview'):
+            with st.spinner("🚀 渲染预览中..."):
+                preview_html = generate_html(
+                    doc, page_num, page_num, mode="screenshot",
+                    font_size=ui_font_size,
+                    line_height=ui_line_height,
+                    img_width=ui_img_width
+                )
+                components.html(preview_html, height=850, scrolling=True)
+        else:
+            st.info("👈 点击“翻译此页”")
+
+    else:
+        st.subheader("📄 批量导出")
+        c1, c2 = st.columns(2)
+        with c1:
+            start = st.number_input("起始页", 1, len(doc), 1)
+        with c2:
+            end = st.number_input("结束页", 1, len(doc), min(3, len(doc)))
+
+        style_code = "screenshot" if "对照" in export_style else "pure"
+
+        if st.button("🚀 生成 PDF", type="primary"):
+            st.session_state["translate_errors"] = []
+
+            bar = st.progress(0)
+            status = st.empty()
+
+            status.text("正在翻译 + 构建 HTML（带缓存/重试/图识别）...")
+            full_html = generate_html(
+                doc, start, end, mode=style_code, filename=uploaded_file.name,
+                font_size=ui_font_size,
+                line_height=ui_line_height,
+                img_width=ui_img_width
+            )
+
+            bar.progress(70)
+
+            status.text("正在生成 PDF...")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
+                if ok:
+                    bar.progress(100)
+                    if st.session_state.get("translate_errors"):
+                        status.warning(f"✅ 完成，但有 {len(st.session_state['translate_errors'])} 条翻译错误（已尽量用原文回退）。")
+                    else:
+                        status.success("✅ 完成！")
+
+                    fname = "Translation_V40.pdf"
+                    with open(tmp_pdf.name, "rb") as f:
+                        st.download_button("📥 下载文件", f, fname)
+                else:
+                    st.error(f"失败: {msg}")
