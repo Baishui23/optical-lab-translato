@@ -66,7 +66,7 @@ MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache:
 """
 
 # ==========================================
-# 2. 核心逻辑 (智能识图 V5.0)
+# 2. 核心逻辑 (智能识图 V6.0 - 同列回溯)
 # ==========================================
 
 def image_to_base64(pil_image):
@@ -117,11 +117,8 @@ def batch_translate_elements(elements):
     return elements
 
 def capture_image_area(page, top, bottom):
-    # 如果计算出的区域小于 10px，说明有问题，可能需要兜底逻辑
     height = bottom - top
-    
-    # 兜底：如果高度太小（比如重叠了），强制向上抓取 250px (经验值)
-    # 这对双栏排版中紧贴顶部的图片非常有效
+    # 兜底：如果高度太小（比如重叠了），强制向上抓取 250px
     if height < 20: 
         top = max(50, bottom - 300) 
     
@@ -134,39 +131,20 @@ def capture_image_area(page, top, bottom):
     except:
         return None
 
-# 🔥【核心修正函数】寻找当前列的“天花板” 🔥
+# 🔥【核心修正函数】寻找当前列的“天花板”
 def find_image_top(caption_rect, all_blocks, page_header_height=60):
-    """
-    不依赖上一段文字，而是查找：
-    在所有block中，位于caption正上方，且在水平方向上有重叠（同列）的最低那个block的底部。
-    """
-    caption_mid_x = (caption_rect.x0 + caption_rect.x1) / 2
-    
-    # 默认天花板是页面顶部（避开页眉）
     ceiling = page_header_height 
-    
     for b in all_blocks:
         b_rect = fitz.Rect(b[:4])
-        
-        # 1. 必须在 caption 的上方
         if b_rect.y1 <= caption_rect.y0:
-            # 2. 必须在水平方向上有交集（判断是否同列）
-            # 简单判断：block的中间点是否在 caption 的左右边界内，或者反过来
-            b_mid_x = (b_rect.x0 + b_rect.x1) / 2
-            
-            # 宽松的同列判定 (只要x轴有重叠)
             is_same_column = not (b_rect.x1 < caption_rect.x0 or b_rect.x0 > caption_rect.x1)
-            
             if is_same_column:
-                # 3. 如果这个 block 比当前记录的 ceiling 更靠下，它就是新的天花板
                 if b_rect.y1 > ceiling:
                     ceiling = b_rect.y1
-                    
     return ceiling
 
 def parse_page(page):
     raw_elements = []
-    # 获取所有 block，保留给 find_image_top 用
     blocks = page.get_text("blocks", sort=True)
     valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page.rect.height)]
     
@@ -178,18 +156,12 @@ def parse_page(page):
         if is_caption_node(text_content):
             # 🌟 调用智能算法：寻找这幅图的真实顶部
             image_top = find_image_top(b_rect, valid_blocks)
-            image_bottom = b_rect.y0 # 图注的顶边就是图的底边
-            
-            # 截图
+            image_bottom = b_rect.y0 
             img = capture_image_area(page, image_top, image_bottom)
-            
             if img:
                 raw_elements.append({'type': 'image', 'content': img})
-            
             raw_elements.append({'type': 'caption', 'content': text_content})
-            
         else:
-            # 普通文本
             raw_elements.append({'type': 'text', 'content': text_content})
 
     return batch_translate_elements(raw_elements)
@@ -267,7 +239,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
 # ==========================================
 # 4. UI 入口
 # ==========================================
-st.title("🔬 光学室学术论文翻译专用版 (V60 同列回溯修复版)")
+st.title("🔬 光学室学术论文翻译专用版 (V60)")
 
 uploaded_file = st.sidebar.file_uploader("上传 PDF", type="pdf")
 with st.sidebar.expander("🎨 排版设置"):
@@ -292,5 +264,7 @@ if uploaded_file:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 ok, msg = html_to_pdf_with_chrome(full_html, tmp.name)
                 if ok: 
-                    with open(tmp.name, "rb") as f: st.download_button("📥 下载 PDF", f, "Translated.pdf")
+                    with open(tmp.name, "rb") as f: 
+                        # 👇 这里的名字已经改为你要求的 Translated_Paper.pdf
+                        st.download_button("📥 下载 PDF", f, "Translated_Paper.pdf")
                 else: st.error(msg)
