@@ -135,85 +135,41 @@ def get_next_client():
     if not KEY_CYCLE: return None
     return OpenAI(api_key=next(KEY_CYCLE), base_url=BASE_URL)
 
-# === V49 核心功能：公式预修复 Hard-coded Rules ===
-def pre_fix_formulas(text: str) -> str:
-    """在发送给 LLM 之前，使用正则匹配修复最常见的破碎琼斯矢量和矩阵。"""
+# === V50 核心功能：公式预清洗（只做清理，不做复杂正则） ===
+def pre_clean_text(text: str) -> str:
+    """在发送给 LLM 之前，强力清理 PDF 提取的垃圾字符画，避免 LLM 混淆。"""
     
-    # 1. 修复琼斯矢量 E_in = [1; 0] (最常出现在光学论文中)
-    # 匹配模式：E_in = (1) 0 (1) 或 E_in = | \ 1 \ 0 \ | / 这种混乱结构
-    # 由于 PyMuPDF 提取极其混乱，我们尝试匹配其上下文关键词和断裂的数字
-    # 关键词：Ein, E_{in}, 1, 0, |\, /, \n
+    # 移除常见的 PDF 提取的破碎符号：
+    text = text.replace('/|', ' ')  # 移除 /| 可能是矩阵/矢量的左括号
+    text = text.replace('|\\', ' ') # 移除 |\\ 可能是矩阵/矢量的右括号
+    text = text.replace('\\/', ' ') # 移除 \/
+    text = text.replace('\\', ' ')  # 移除多余的反斜杠
+    text = text.replace('  ', ' ')  # 合并多余空格
     
-    # 示例破碎结构:
-    # E_in = 1 \n 0 \n (1)
-    # E_in = /| \n /| 1 \n /| \n 0 \n /|
+    # 移除被破碎的公式编号 (e.g., / (1) /)
+    text = re.sub(r'\s*\(\d\)\s*/', ' ', text)
+    text = re.sub(r'/\s*\(\d\)\s*', ' ', text)
     
-    # 简化匹配：如果文本中包含 E_in/E_m, 1, 0，且前后有换行符，且靠近一个公式编号
-    # 我们先对 Ein 的情况进行一个精确替换 (假设原文公式结构是固定的)
+    # 尝试将连续的数字/字母和换行符替换为特殊标记，提示LLM这里是一个垂直结构
+    text = re.sub(r'(\w+)\s*\n\s*(\w+)', r'\1 [VERTICAL_SPLIT] \2', text)
     
-    # Hard-coded Rule 1: 入射琼斯矢量 E_in
-    # 寻找：(E_in 或 E_m) 后面跟着 (1) 接着 (0) 接着 (1) 或 (Ein = /| \ 1 \ 0 \)
-    pattern_ein = re.compile(
-        r'(E_{in}|E_{m}|E_{t}|E_{s}|Ein|Em|Et|Es)\s*=\s*(?:.*?)(\d)\s*(\d)\s*(?:.*?)(\(1\)|\(2\)|\(3\)|\(4\))', 
-        re.DOTALL | re.IGNORECASE
-    )
-    # 如果检测到类似结构，替换为标准的 LaTeX 矩阵
-    match = pattern_ein.search(text)
-    if match:
-        # 提取变量名和公式编号
-        var_name = match.group(1)
-        # number_1 = match.group(2) # 1
-        # number_2 = match.group(3) # 0
-        eq_num = match.group(4)
-        
-        # 琼斯矢量通常是 [1, 0] 或 [0, 1]
-        latex_vector = f'$$ {var_name} = \\begin{{pmatrix}} 1 \\\\ 0 \\end{{pmatrix}} \quad {eq_num} $$'
-        # 替换包含整个破碎公式的区域
-        text = pattern_ein.sub(latex_vector, text)
+    return text.strip()
 
-
-    # Hard-coded Rule 2: S-waveplate 传输矩阵 T(α) (更复杂，更易破碎)
-    # 破碎结构示例：T(α) = cos α sin α \n sin α -cos α \n (2)
-    # 寻找：T(α) 或 T(a) 后面跟着 cos/sin/α 接着 (2)
-    pattern_t_alpha = re.compile(
-        r'(T(\(\alpha\))|T\(a\))\s*=\s*(?:.*?)(\cos\s*\alpha|\cos\s*a)\s*(\sin\s*\alpha|\sin\s*a)(?:.*?)(\sin\s*\alpha|\sin\s*a)\s*(\-\cos\s*\alpha|\-\cos\s*a)(?:.*?)(\(2\))',
-        re.DOTALL | re.IGNORECASE
-    )
-
-    match = pattern_t_alpha.search(text)
-    if match:
-        eq_num = match.group(7)
-        latex_matrix = f'$$ T(\\alpha) = \\begin{{pmatrix}} \\cos \\alpha & \\sin \\alpha \\\\ \\sin \\alpha & -\\cos \\alpha \\end{{pmatrix}} \quad {eq_num} $$'
-        text = pattern_t_alpha.sub(latex_matrix, text)
-        
-    # Hard-coded Rule 3: E_t = T(α)E_in (3)
-    # 寻找：E_t = T(α)E_in 后面跟着复杂的公式串 接着 (3)
-    pattern_et_matrix = re.compile(
-        r'(E_{t}|Et)\s*=\s*(T(\(\alpha\))|T\(a\))\s*(E_{in}|Ein)(?:.*?)(\(3\))',
-        re.DOTALL | re.IGNORECASE
-    )
-
-    match = pattern_et_matrix.search(text)
-    if match:
-        eq_num = match.group(5)
-        # 用一个标准的 LaTeX 替换掉中间可能破碎的公式部分
-        latex_et = f'$$ E_t = T(\\alpha)E_{{in}} = \\begin{{pmatrix}} \\cos \\alpha & \\sin \\alpha \\\\ \\sin \\alpha & -\\cos \\alpha \\end{{pmatrix}} \\begin{{pmatrix}} 1 \\\\ 0 \\end{{pmatrix}} \quad {eq_num} $$'
-        text = pattern_et_matrix.sub(latex_et, text)
-
-
-    return text
-
-# === V48 核心功能：带重试的翻译函数 (略作优化) ===
+# === V50 核心功能：带重试的翻译函数 ===
 def translate_text(text: str, is_caption: bool, max_retries: int = 3) -> str:
     if len(text.strip()) < 2: return text
     
-    # V49 关键：先进行硬编码公式修复
-    fixed_text = pre_fix_formulas(text)
+    # V50 关键：先进行文本预清洗
+    cleaned_text = pre_clean_text(text)
     
-    sys_prompt = """你是一位精通光学和量子物理的学术翻译专家。
+    # 降低温度，让模型更“保守”和“稳定”地进行修复
+    temperature = 0.1 
+    
+    sys_prompt = f"""你是一位精通光学和量子物理的学术翻译专家。
     【任务】
     1. 将用户提供的英文学术文本翻译成**流畅、准确的简体中文**。
-    2. **如果原文中依然存在未修复的 LaTeX 公式破碎，你必须根据上下文将其还原为标准的 LaTeX 格式**（使用 `$$...$$` 或 `$...$`）。
+    2. **核心修复**：你收到的文本可能已经被我进行了初步的清理（例如移除了破碎符号）。但如果文本中仍然存在破碎的数学公式结构（例如琼斯矩阵/矢量，其中可能包含 '[VERTICAL_SPLIT]' 标记），你**必须**根据上下文将其还原为标准的 LaTeX 格式（使用 `$$...$$` 或 `$...$`）。
+       - 例子：看到 'E_in = 1 [VERTICAL_SPLIT] 0 (1)'，请输出 '入射琼斯矢量表示为：$$ E_{in} = \begin{{pmatrix}} 1 \\\\ 0 \end{{pmatrix}} \quad (1) $$'
     3. **绝对禁止**直接输出英文原文。必须翻译！
     4. 不要输出任何解释性文字，只输出翻译后的正文。
     """
@@ -225,15 +181,15 @@ def translate_text(text: str, is_caption: bool, max_retries: int = 3) -> str:
         if not client: return "[Key未配置]"
         
         try:
-            # 使用预修复后的文本
+            # 使用预清洗后的文本
             response = client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": sys_prompt}, 
-                    {"role": "user", "content": f"Please translate and fix LaTeX:\n\n{fixed_text}"}
+                    {"role": "user", "content": f"Please translate and fix LaTeX:\n\n{cleaned_text}"}
                 ],
                 stream=False,
-                temperature=0.3
+                temperature=temperature
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -263,7 +219,7 @@ def capture_image_between_blocks(page, prev_bottom, current_top):
     except: 
         return None
 
-# 智能拼合算法（V47）
+# 智能拼合算法（保持不变）
 def smart_merge_blocks(blocks):
     merged = []
     if not blocks: return merged
@@ -290,6 +246,7 @@ def smart_merge_blocks(blocks):
                 current_text = b_text
                 current_rect = b_rect
             else:
+                # 距离近，拼合，用换行符连接
                 current_text += "\n" + b_text 
                 current_rect = current_rect | b_rect 
         else:
@@ -337,6 +294,7 @@ def batch_translate_elements(elements):
     
     if not tasks: return elements
 
+    # 稳定版，保持低并发
     max_workers = 4 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(executor.map(lambda p: translate_text(p[0], p[1]), tasks))
@@ -446,7 +404,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         return False, str(e)
 
 # --- 5. 界面逻辑 ---
-st.title("🔬 光学室学术论文翻译 (V49 绝境求生版)")
+st.title("🔬 光学室学术论文翻译 (V50 终极稳定版)")
 
 with st.sidebar:
     st.markdown("""
@@ -454,7 +412,7 @@ with st.sidebar:
         <h4 style="margin:0; color:#333;">👤 专属定制</h4>
         <p style="margin:5px 0 0 0; font-size:14px; color:#555;">
         <strong>制作人：</strong> 白水<br>
-        <strong>版本：</strong> V49 (Hard-coded 公式直修)<br>
+        <strong>版本：</strong> V50 (代码稳定，LLM 强化修复)<br>
         <strong>微信：</strong> <code style="background:white;">guo21615</code>
         </p>
     </div>
@@ -492,7 +450,7 @@ if uploaded_file:
                 st.session_state['run_preview'] = True
         
         if st.session_state.get('run_preview'):
-             with st.spinner("🚀 正在硬编码修复公式 & 容错翻译中..."):
+             with st.spinner("🚀 正在强力清洗文本 & 容错翻译中..."):
                 preview_html = generate_html(doc, page_num, page_num, mode="screenshot", 
                                              font_size=13, line_height=1.4, img_width=50)
                 components.html(preview_html, height=800, scrolling=True)
@@ -513,7 +471,7 @@ if uploaded_file:
             else:
                 bar = st.progress(0)
                 status = st.empty()
-                status.text("正在进行硬编码公式修复与容错翻译...")
+                status.text("正在进行文本清洗、LLM 强化修复与容错翻译...")
                 
                 full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name,
                                           font_size=ui_font_size, line_height=ui_line_height, img_width=ui_img_width)
@@ -523,9 +481,9 @@ if uploaded_file:
                     ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
                     if ok:
                         bar.progress(100)
-                        status.success("✅ 修复完成！翻译回来了！")
-                        fname = "Translation_V49_HardFix.pdf"
+                        status.success("✅ 修复完成！程序稳定了！")
+                        fname = "Translation_V50_Stable.pdf"
                         with open(tmp_pdf.name, "rb") as f:
                             st.download_button("📥 下载文件", f, fname)
                     else:
-                        st.error(f"失败: {msg}")
+                        st.error(f"❌ PDF 生成失败: {msg}")
