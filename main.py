@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import cycle
 
 # ==========================================
-# 👇 【关键配置】请在这里填入你的所有 Key 👇
+# 👇 【关键配置】请在这里填入你的 API Key 👇
 # ==========================================
 USER_KEYS = [
     "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
@@ -38,7 +38,7 @@ KEY_CYCLE = cycle(VALID_KEYS) if VALID_KEYS else None
 
 st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
 
-# --- 1. CSS 样式 (优化公式字体) ---
+# --- 1. CSS 样式 (解决公式溢出 & 字体优化) ---
 def get_css(mode="pure", font_size=16, line_height=1.6, img_width_pct=50):
     base_css = """
     @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&display=swap');
@@ -49,8 +49,9 @@ def get_css(mode="pure", font_size=16, line_height=1.6, img_width_pct=50):
     .caption { font-size: 14px; color: #444; text-align: center; font-weight: bold; margin-bottom: 15px; font-family: sans-serif; }
     .page-break { page-break-before: always; margin-top: 30px; border-top: 1px dashed #eee; padding-top: 10px; text-align: center; color: #ccc; font-size: 12px; }
     .page-break.first-page { page-break-before: avoid; display: none; }
-    /* 修复公式溢出 */
-    .MathJax_Display { overflow-x: auto; overflow-y: hidden; max-width: 100%; }
+    /* 强制公式不换行，允许横向滚动 */
+    .MathJax_Display { overflow-x: auto; overflow-y: hidden; max-width: 100%; text-align: center; margin: 1em 0; }
+    mjx-container { overflow-x: auto; overflow-y: hidden; max-width: 100%; }
     @media print { .page-break { border: none; color: transparent; margin: 0; height: 0; } }
     """
 
@@ -88,7 +89,6 @@ def get_css(mode="pure", font_size=16, line_height=1.6, img_width_pct=50):
                 width: {text_width_pct}%; padding-left: 10px;
                 text-align: justify; overflow-wrap: break-word;
             }}
-            /* 修正右侧图片的显示 */
             .right-col-text img {{ max-width: 98%; display: block; margin: 10px auto; border: 1px solid #eee; }}
         </style>
         """
@@ -99,7 +99,8 @@ window.MathJax = {
   tex: {
     inlineMath: [['$', '$'], ['\\(', '\\)']],
     displayMath: [['$$', '$$'], ['\\[', '\\]']],
-    processEscapes: true
+    processEscapes: true,
+    tags: 'ams'
   },
   svg: {
     fontCache: 'global'
@@ -122,11 +123,8 @@ def is_header_or_footer(rect, page_height):
     if rect.y0 > page_height - 50: return True
     return False
 
-# === 关键修复 1：放宽图注识别规则 ===
 def is_caption_node(text):
     text = text.strip()
-    # 只要是 "Figure" 或 "Fig." 后面跟数字，就算图注！
-    # 不再强制要求后面必须有点或冒号，兼容 "Figure 1(b)" 这种写法
     if re.match(r'^Fig(ure)?\.?\s?\d+', text, re.IGNORECASE):
         return True
     return False
@@ -135,51 +133,137 @@ def get_next_client():
     if not KEY_CYCLE: return None
     return OpenAI(api_key=next(KEY_CYCLE), base_url=BASE_URL)
 
-# === 关键修复 2：V27 灵魂 Prompt + 强力公式修复 ===
+# === 关键修复：V47 强力翻译 & 公式重构 ===
 def translate_text(text, is_caption=False):
     if len(text.strip()) < 2: return text
     
     client = get_next_client()
     if not client: return "[Key未配置]"
 
-    # 这里使用了你最认可的 V27 风格，但增加了一句关于破碎公式的指令
-    sys_prompt = """你是一个专业的物理学术翻译。请将文本翻译成流畅的学术中文。
-    【规则】
-    1. 保持学术严谨性。
-    2. 公式必须用 $...$ 或 $$...$$ 包裹。
-    3. **重要：** 如果原文中的公式因为PDF提取而变成了“字符画”或多行乱码（例如矩阵被拆成了多行数字），请务必根据上下文将其还原为标准的 LaTeX 公式（如 \\begin{pmatrix}...\\end{pmatrix}）。
-    4. 直接输出译文，不要加任何前缀或解释。
+    # Prompt 重点：强制中文，强制 LaTeX 修复
+    sys_prompt = """你是一位精通光学和量子物理的学术翻译专家。
+    【任务】
+    1. 将用户提供的英文学术文本翻译成**流畅、准确的简体中文**。
+    2. **核心修正**：原文中的数学公式可能因为PDF提取而断裂（例如矩阵变成多行数字）。你必须根据上下文（如 Jones Matrix, Vector）将其还原为标准的 LaTeX 格式（使用 `$$...$$` 或 `$...$`）。
+       - 例子：看到竖着的 `1` 和 `0`，如果上下文是 Jones vector，请输出 `$$ \begin{pmatrix} 1 \\ 0 \end{pmatrix} $$`。
+       - 例子：看到 `cos a sin a`，还原为矩阵 `\begin{pmatrix} \cos\alpha & \sin\alpha \\ ... \end{pmatrix}`。
+    3. **绝对禁止**直接输出英文原文。必须翻译！
+    4. 不要输出任何解释性文字，只输出翻译后的正文。
     """
-    if is_caption: sys_prompt += " (这是图注，请保留 Figure 编号)"
+    
+    if is_caption: sys_prompt += " (注意：这是图片说明，请保留 Figure 编号，例如 '图1(a) 展示了...') "
     
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
-            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": text}],
-            stream=False
+            messages=[
+                {"role": "system", "content": sys_prompt}, 
+                {"role": "user", "content": f"Please translate and fix LaTeX:\n\n{text}"} # 显式要求翻译
+            ],
+            stream=False,
+            temperature=0.3 # 降低随机性，提高准确度
         )
         return response.choices[0].message.content
     except Exception as e:
         print(f"Error: {e}")
-        return text
+        return f"【翻译失败】{text}" # 标记失败，而不是静默返回英文
 
 def capture_image_between_blocks(page, prev_bottom, current_top):
-    # 阈值放宽到 10，确保紧凑的图能被抓到
     if current_top - prev_bottom < 10: return None
-    
     safe_top = prev_bottom + 2
     safe_bottom = current_top - 2
-    
     if safe_bottom <= safe_top: return None
 
     rect = fitz.Rect(50, safe_top, page.rect.width - 50, safe_bottom)
     try:
         pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=rect, alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
-        # 只要高度大于 10px 就算有效图
-        return img if img.size[1] >= 10 else None
+        if img.size[1] >= 20: # 稍微提高阈值，过滤掉杂线
+            return img
+        return None
     except: 
         return None
+
+# === V47 核心算法：文本块智能拼合 ===
+# 解决 PyMuPDF 把一个公式拆成两段发给 LLM 导致无法识别的问题
+def smart_merge_blocks(blocks):
+    merged = []
+    if not blocks: return merged
+    
+    # 按垂直位置排序
+    blocks.sort(key=lambda b: b[1]) # b[1] is y0
+    
+    current_text = ""
+    current_type = "text"
+    current_rect = None
+    
+    for b in blocks:
+        # b 结构: (x0, y0, x1, y1, text, block_no, block_type)
+        b_text = b[4]
+        b_rect = fitz.Rect(b[:4])
+        
+        # 如果是图注，单独处理，不合并
+        if is_caption_node(b_text):
+            # 先把之前的 buffer 存了
+            if current_text:
+                merged.append({'type': 'text', 'content': current_text, 'rect': current_rect})
+                current_text = ""
+            merged.append({'type': 'caption', 'content': b_text, 'rect': b_rect})
+            continue
+
+        # 判断是否应该合并（距离近 且 格式相似）
+        # 这里简化逻辑：只要不是图注，且距离不算太远，就拼在一起发给 LLM
+        # 这样 LLM 就能看到 "Jones vector" 和 "1 \n 0" 在一起，就能修了！
+        if current_text:
+            # 如果两个块垂直距离超过 50px，认为可能是分段了，先结算之前的
+            if b_rect.y0 - current_rect.y1 > 50:
+                merged.append({'type': 'text', 'content': current_text, 'rect': current_rect})
+                current_text = b_text
+                current_rect = b_rect
+            else:
+                current_text += "\n" + b_text # 用换行符连接，保持空间结构给 LLM 参考
+                current_rect = current_rect | b_rect # 合并矩形
+        else:
+            current_text = b_text
+            current_rect = b_rect
+            
+    if current_text:
+        merged.append({'type': 'text', 'content': current_text, 'rect': current_rect})
+        
+    return merged
+
+def parse_page(page):
+    # 1. 获取所有块
+    blocks = page.get_text("blocks", sort=True)
+    valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page.rect.height)]
+    
+    # 2. 智能合并（这是解决公式破碎的关键！）
+    merged_elements = smart_merge_blocks(valid_blocks)
+    
+    # 3. 提取图片（基于合并后的元素位置）
+    final_elements = []
+    last_bottom = 50
+    
+    for el in merged_elements:
+        el_top = el['rect'].y0
+        
+        # 尝试在当前文本块上方抓图
+        if el['type'] == 'caption':
+            img = capture_image_between_blocks(page, last_bottom, el_top)
+            if img: final_elements.append({'type': 'image', 'content': img})
+            final_elements.append(el)
+        else:
+            # 普通文本，先检查上面有没有漏掉的图（针对无图注的图，或者单纯的间距）
+            # 但为了避免误抓，这里主要依赖 caption 触发抓图，或者大间隙
+            if el_top - last_bottom > 150: # 间隙很大，可能有图
+                img = capture_image_between_blocks(page, last_bottom, el_top)
+                if img: final_elements.append({'type': 'image', 'content': img})
+            final_elements.append(el)
+            
+        last_bottom = el['rect'].y1
+
+    # 4. 批量翻译
+    return batch_translate_elements(final_elements)
 
 def batch_translate_elements(elements):
     tasks = []
@@ -191,7 +275,7 @@ def batch_translate_elements(elements):
     
     if not tasks: return elements
 
-    max_workers = 8 if len(VALID_KEYS) >= 3 else 4
+    max_workers = 6 # 稍微降低并发，保证稳定性
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(executor.map(lambda p: translate_text(p[0], p[1]), tasks))
     
@@ -199,48 +283,18 @@ def batch_translate_elements(elements):
         elements[idx_in_elements]['content'] = results[idx_in_tasks]
     return elements
 
-def parse_page(page):
-    raw_elements = []
-    blocks = page.get_text("blocks", sort=True)
-    last_bottom = 50 
-    text_buffer = ""
-    valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page.rect.height)]
-    
-    for i, b in enumerate(valid_blocks):
-        b_rect = fitz.Rect(b[:4])
-        b_top = b_rect.y0
-        
-        # 识别图注
-        if is_caption_node(b[4]):
-            if text_buffer.strip():
-                raw_elements.append({'type': 'text', 'content': text_buffer})
-                text_buffer = ""
-            
-            # 抓取图注上方的图片
-            img = capture_image_between_blocks(page, last_bottom, b_top)
-            if img: raw_elements.append({'type': 'image', 'content': img})
-            
-            raw_elements.append({'type': 'caption', 'content': b[4]})
-        else:
-            text_buffer += b[4] + "\n\n"
-        
-        last_bottom = b_rect.y1
-        
-    if text_buffer.strip():
-        raw_elements.append({'type': 'text', 'content': text_buffer})
-        
-    return batch_translate_elements(raw_elements)
-
 def get_page_image(page):
     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
     img = Image.open(io.BytesIO(pix.tobytes("png")))
     return img
 
 def clean_latex(text):
+    # 清理一下 LLM 可能多输出的 Markdown 标记
+    text = re.sub(r'^```(latex|markdown)?', '', text.strip())
+    text = re.sub(r'```$', '', text.strip())
+    # 统一替换括号
     text = text.replace(r'\[', '$$').replace(r'\]', '$$')
     text = text.replace(r'\(', '$').replace(r'\)', '$')
-    text = re.sub(r'```latex', '', text)
-    text = re.sub(r'```', '', text)
     return text
 
 # --- 3. HTML 构建器 ---
@@ -265,9 +319,15 @@ def generate_html(doc, start, end, mode="pure", filename="Document", font_size=1
             """
             for el in page_els:
                 if el['type'] == 'text':
-                    paras = clean_latex(el['content']).split('\n\n')
-                    for p in paras:
-                        if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
+                    # 处理段落
+                    clean_content = clean_latex(el['content'])
+                    # 如果包含公式，直接当做一个块输出，避免拆分 p 标签破坏公式
+                    if "$$" in clean_content:
+                        html_body += f"<div>{clean_content}</div>"
+                    else:
+                        paras = clean_content.split('\n\n')
+                        for p in paras:
+                            if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
                 elif el['type'] == 'image':
                     html_body += f'<img src="{image_to_base64(el["content"])}" />'
                 elif el['type'] == 'caption':
@@ -278,9 +338,13 @@ def generate_html(doc, start, end, mode="pure", filename="Document", font_size=1
             html_body += '<div class="pure-content">'
             for el in page_els:
                 if el['type'] == 'text':
-                    paras = clean_latex(el['content']).split('\n\n')
-                    for p in paras:
-                        if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
+                    clean_content = clean_latex(el['content'])
+                    if "$$" in clean_content:
+                         html_body += f"<div>{clean_content}</div>"
+                    else:
+                        paras = clean_content.split('\n\n')
+                        for p in paras:
+                            if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
                 elif el['type'] == 'image':
                     html_body += f'<img src="{image_to_base64(el["content"])}" />'
                 elif el['type'] == 'caption':
@@ -326,7 +390,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         return False, str(e)
 
 # --- 5. 界面逻辑 ---
-st.title("🔬 光学室学术论文翻译 (V46 终极修正版)")
+st.title("🔬 光学室学术论文翻译 (V47 终极修复版)")
 
 with st.sidebar:
     st.markdown("""
@@ -334,6 +398,7 @@ with st.sidebar:
         <h4 style="margin:0; color:#333;">👤 专属定制</h4>
         <p style="margin:5px 0 0 0; font-size:14px; color:#555;">
         <strong>制作人：</strong> 白水<br>
+        <strong>版本：</strong> V47 (强力公式修复)<br>
         <strong>微信：</strong> <code style="background:white;">guo21615</code>
         </p>
     </div>
@@ -353,8 +418,8 @@ with st.sidebar:
         export_style = st.radio("导出风格：", ["纯净译文版 (竖向)", "中英对照版 (横向·左图右文)"], index=1)
         if "对照" in export_style:
             with st.expander("🎨 对照版排版设置", expanded=True):
-                ui_font_size = st.slider("字体大小", 10, 18, 14)
-                ui_line_height = st.slider("行间距", 1.2, 2.0, 1.5)
+                ui_font_size = st.slider("字体大小", 10, 18, 13)
+                ui_line_height = st.slider("行间距", 1.2, 2.0, 1.4)
                 ui_img_width = st.slider("左图占比 (%)", 30, 70, 50)
         else:
             ui_font_size, ui_line_height, ui_img_width = 16, 1.6, 0
@@ -371,9 +436,9 @@ if uploaded_file:
                 st.session_state['run_preview'] = True
         
         if st.session_state.get('run_preview'):
-             with st.spinner("🚀 正在修复公式 & 提取图片..."):
+             with st.spinner("🚀 正在智能拼合文本块 & 修复 LaTeX 公式..."):
                 preview_html = generate_html(doc, page_num, page_num, mode="screenshot", 
-                                             font_size=14, line_height=1.5, img_width=50)
+                                             font_size=13, line_height=1.4, img_width=50)
                 components.html(preview_html, height=800, scrolling=True)
         else:
              st.info("👈 点击“翻译此页”")
@@ -392,7 +457,7 @@ if uploaded_file:
             else:
                 bar = st.progress(0)
                 status = st.empty()
-                status.text("正在多核并发翻译 (含公式重组)...")
+                status.text("正在进行智能分段与多核翻译...")
                 
                 full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name,
                                           font_size=ui_font_size, line_height=ui_line_height, img_width=ui_img_width)
@@ -402,8 +467,8 @@ if uploaded_file:
                     ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
                     if ok:
                         bar.progress(100)
-                        status.success("✅ 修复完成！请查收！")
-                        fname = "Translation_V46_Final.pdf"
+                        status.success("✅ 修复完成！翻译回来了！公式也修好了！")
+                        fname = "Translation_V47_Fixed.pdf"
                         with open(tmp_pdf.name, "rb") as f:
                             st.download_button("📥 下载文件", f, fname)
                     else:
