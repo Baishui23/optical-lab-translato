@@ -135,47 +135,25 @@ def get_next_client():
     if not KEY_CYCLE: return None
     return OpenAI(api_key=next(KEY_CYCLE), base_url=BASE_URL)
 
-# === V50 核心功能：公式预清洗（只做清理，不做复杂正则） ===
-def pre_clean_text(text: str) -> str:
-    """在发送给 LLM 之前，强力清理 PDF 提取的垃圾字符画，避免 LLM 混淆。"""
-    
-    text = text.replace('/|', ' ')
-    text = text.replace('|\\', ' ')
-    text = text.replace('\\/', ' ')
-    text = text.replace('\\', ' ')
-    text = text.replace('  ', ' ')
-    
-    text = re.sub(r'\s*\(\d\)\s*/', ' ', text)
-    text = re.sub(r'/\s*\(\d\)\s*', ' ', text)
-    
-    # 尝试将连续的数字/字母和换行符替换为特殊标记，提示LLM这里是一个垂直结构
-    text = re.sub(r'(\w+)\s*\n\s*(\w+)', r'\1 [VERTICAL_SPLIT] \2', text)
-    
-    return text.strip()
-
-# === V51 修复：将 sys_prompt 定义为常量，避免 f-string 风险 ===
-_SYS_PROMPT_BASE = r"""你是一位精通光学和量子物理的学术翻译专家。
-【任务】
-1. 将用户提供的英文学术文本翻译成**流畅、准确的简体中文**。
-2. **核心修复**：你收到的文本可能已经被我进行了初步的清理（例如移除了破碎符号）。但如果文本中仍然存在破碎的数学公式结构（例如琼斯矩阵/矢量，其中可能包含 '[VERTICAL_SPLIT]' 标记），你**必须**根据上下文将其还原为标准的 LaTeX 格式（使用 `$$...$$` 或 `$...$`）。
-   - 例子：看到 'E_in = 1 [VERTICAL_SPLIT] 0 (1)'，请输出 '入射琼斯矢量表示为：$$ E_{in} = \begin{pmatrix} 1 \\ 0 \end{pmatrix} \quad (1) $$'
-3. **绝对禁止**直接输出英文原文。必须翻译！
-4. 不要输出任何解释性文字，只输出翻译后的正文。
-"""
-
-_SYS_PROMPT_CAPTION = r""" (注意：这是图片说明，请保留 Figure 编号，例如 '图1(a) 展示了...') """
-
-# === V50 核心功能：带重试的翻译函数 ===
+# === V27 翻译函数 (带简单重试) ===
 def translate_text(text: str, is_caption: bool, max_retries: int = 3) -> str:
     if len(text.strip()) < 2: return text
     
-    cleaned_text = pre_clean_text(text)
+    # 移除 V50 的清洗，回归 LLM 自己的判断
+    cleaned_text = text.strip() 
     
-    temperature = 0.1 
+    temperature = 0.3 
     
-    sys_prompt = _SYS_PROMPT_BASE
+    # V27 原始 Prompt
+    sys_prompt = """你是一位精通光学和量子物理的学术翻译专家。
+    【任务】
+    1. 将用户提供的英文学术文本翻译成**流畅、准确的简体中文**。
+    2. **核心修正**：原文中的数学公式可能因为PDF提取而断裂或丢失 LaTeX 标记。你必须根据上下文将其还原为标准的 LaTeX 格式（使用 `$$...$$` 或 `$...$`）。
+    3. **绝对禁止**直接输出英文原文。必须翻译！
+    4. 不要输出任何解释性文字，只输出翻译后的正文。
+    """
     if is_caption: 
-        sys_prompt += _SYS_PROMPT_CAPTION
+        sys_prompt += " (注意：这是图片说明，请保留 Figure 编号，例如 '图1(a) 展示了...') "
 
     for attempt in range(max_retries):
         client = get_next_client()
@@ -197,6 +175,7 @@ def translate_text(text: str, is_caption: bool, max_retries: int = 3) -> str:
             print(f"API Error (Attempt {attempt + 1}/{max_retries}): {error_msg}")
             if attempt == max_retries - 1:
                 return f"【翻译失败】{text}" 
+            # 容错重试机制保留，防止 API 瞬时限流
             time.sleep(2 ** attempt)
             continue
     
@@ -219,7 +198,7 @@ def capture_image_between_blocks(page, prev_bottom, current_top):
     except: 
         return None
 
-# 智能拼合算法（保持不变）
+# 智能拼合算法（V27基线版本，略微放松合并条件）
 def smart_merge_blocks(blocks):
     merged = []
     if not blocks: return merged
@@ -241,7 +220,7 @@ def smart_merge_blocks(blocks):
             continue
 
         if current_text:
-            if b_rect.y0 - current_rect.y1 > 50: 
+            if b_rect.y0 - current_rect.y1 > 70: # 稍微提高垂直距离阈值
                 merged.append({'type': 'text', 'content': current_text, 'rect': current_rect})
                 current_text = b_text
                 current_rect = b_rect
@@ -293,7 +272,8 @@ def batch_translate_elements(elements):
     
     if not tasks: return elements
 
-    max_workers = 4 
+    # V27 使用默认并发度（通常为 CPU 核数）
+    max_workers = os.cpu_count() or 4
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(executor.map(lambda p: translate_text(p[0], p[1]), tasks))
     
@@ -402,7 +382,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         return False, str(e)
 
 # --- 5. 界面逻辑 ---
-st.title("🔬 光学室学术论文翻译 (V51 终极语法稳定版)")
+st.title("🔬 光学室学术论文翻译 (V27 基线稳定版)")
 
 with st.sidebar:
     st.markdown("""
@@ -410,7 +390,7 @@ with st.sidebar:
         <h4 style="margin:0; color:#333;">👤 专属定制</h4>
         <p style="margin:5px 0 0 0; font-size:14px; color:#555;">
         <strong>制作人：</strong> 白水<br>
-        <strong>版本：</strong> V51 (语法修复，代码稳定)<br>
+        <strong>版本：</strong> V27 (基线稳定版)<br>
         <strong>微信：</strong> <code style="background:white;">guo21615</code>
         </p>
     </div>
@@ -448,7 +428,7 @@ if uploaded_file:
                 st.session_state['run_preview'] = True
         
         if st.session_state.get('run_preview'):
-             with st.spinner("🚀 正在强力清洗文本 & 容错翻译中..."):
+             with st.spinner("🚀 正在提取文本并翻译..."):
                 preview_html = generate_html(doc, page_num, page_num, mode="screenshot", 
                                              font_size=13, line_height=1.4, img_width=50)
                 components.html(preview_html, height=800, scrolling=True)
@@ -469,7 +449,7 @@ if uploaded_file:
             else:
                 bar = st.progress(0)
                 status = st.empty()
-                status.text("正在进行文本清洗、LLM 强化修复与容错翻译...")
+                status.text("正在进行文本提取与多核翻译...")
                 
                 full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name,
                                           font_size=ui_font_size, line_height=ui_line_height, img_width=ui_img_width)
@@ -479,8 +459,8 @@ if uploaded_file:
                     ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
                     if ok:
                         bar.progress(100)
-                        status.success("✅ 修复完成！程序稳定了！")
-                        fname = "Translation_V51_Stable.pdf"
+                        status.success("✅ PDF 已生成！")
+                        fname = "Translation_V27_Stable.pdf"
                         with open(tmp_pdf.name, "rb") as f:
                             st.download_button("📥 下载文件", f, fname)
                     else:
