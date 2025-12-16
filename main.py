@@ -38,19 +38,19 @@ KEY_CYCLE = cycle(VALID_KEYS) if VALID_KEYS else None
 
 st.set_page_config(page_title="光学室学术论文翻译专用版", page_icon="🔬", layout="wide")
 
-# --- 1. CSS 样式 (优化公式显示) ---
+# --- 1. CSS 样式 (优化公式字体) ---
 def get_css(mode="pure", font_size=16, line_height=1.6, img_width_pct=50):
     base_css = """
     @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700&display=swap');
     body {
-        font-family: "Noto Serif SC", "Times New Roman", serif; /* 加上 Times New Roman 优化公式字体 */
+        font-family: "Noto Serif SC", "Times New Roman", "SimSun", serif;
         color: #000; margin: 0; padding: 0; background-color: white;
     }
     .caption { font-size: 14px; color: #444; text-align: center; font-weight: bold; margin-bottom: 15px; font-family: sans-serif; }
     .page-break { page-break-before: always; margin-top: 30px; border-top: 1px dashed #eee; padding-top: 10px; text-align: center; color: #ccc; font-size: 12px; }
     .page-break.first-page { page-break-before: avoid; display: none; }
-    /* 强制 MathJax 公式左对齐或居中，视情况而定，这里保持默认但增加边距 */
-    .MathJax_Display { margin: 1em 0 !important; overflow-x: auto; overflow-y: hidden; }
+    /* 修复公式溢出 */
+    .MathJax_Display { overflow-x: auto; overflow-y: hidden; max-width: 100%; }
     @media print { .page-break { border: none; color: transparent; margin: 0; height: 0; } }
     """
 
@@ -88,11 +88,11 @@ def get_css(mode="pure", font_size=16, line_height=1.6, img_width_pct=50):
                 width: {text_width_pct}%; padding-left: 10px;
                 text-align: justify; overflow-wrap: break-word;
             }}
-            .right-col-text img {{ max-width: 95%; display: block; margin: 15px auto; border: 1px solid #eee; }}
+            /* 修正右侧图片的显示 */
+            .right-col-text img {{ max-width: 98%; display: block; margin: 10px auto; border: 1px solid #eee; }}
         </style>
         """
 
-# 强制 MathJax 配置，确保它能解析 $...$ 和 $$...$$
 MATHJAX_SCRIPT = """
 <script>
 window.MathJax = {
@@ -122,33 +122,35 @@ def is_header_or_footer(rect, page_height):
     if rect.y0 > page_height - 50: return True
     return False
 
+# === 关键修复 1：放宽图注识别规则 ===
 def is_caption_node(text):
     text = text.strip()
-    return text.startswith("Fig.") or (text.startswith("Figure") and re.match(r'^Figure\s?\d+[.:]', text))
+    # 只要是 "Figure" 或 "Fig." 后面跟数字，就算图注！
+    # 不再强制要求后面必须有点或冒号，兼容 "Figure 1(b)" 这种写法
+    if re.match(r'^Fig(ure)?\.?\s?\d+', text, re.IGNORECASE):
+        return True
+    return False
 
 def get_next_client():
     if not KEY_CYCLE: return None
     return OpenAI(api_key=next(KEY_CYCLE), base_url=BASE_URL)
 
-# === 修复版 Prompt：强力修复公式乱码 ===
+# === 关键修复 2：V27 灵魂 Prompt + 强力公式修复 ===
 def translate_text(text, is_caption=False):
     if len(text.strip()) < 2: return text
     
     client = get_next_client()
     if not client: return "[Key未配置]"
 
-    # 针对 PDF 提取出的破碎公式（如 "1\n0\nEin = / | \"）进行针对性修复
-    sys_prompt = """你是一个专业的物理学术翻译助手。
-    【核心任务】
-    1. 翻译文本：将物理学术英语翻译成流畅、专业的中文。
-    2. **重构公式 (至关重要)**：PDF提取的原文中，公式往往会变成破碎的字符乱码（例如矩阵变成多行字符）。你必须识别这些乱码，并利用上下文将其**重写为正确的 LaTeX 公式**。
-       - 例如：原文若为 "Ein = / 1 \\" 这种乱码，请重构为 "$E_{in} = \\begin{pmatrix} 1 \\\\ 0 \\end{pmatrix}$"。
-       - 行内公式用 $...$ 包裹。
-       - 独立公式用 $$...$$ 包裹。
-    3. 保持排版：直接输出译文，不要加 "翻译：" 前缀，不要加解释。
+    # 这里使用了你最认可的 V27 风格，但增加了一句关于破碎公式的指令
+    sys_prompt = """你是一个专业的物理学术翻译。请将文本翻译成流畅的学术中文。
+    【规则】
+    1. 保持学术严谨性。
+    2. 公式必须用 $...$ 或 $$...$$ 包裹。
+    3. **重要：** 如果原文中的公式因为PDF提取而变成了“字符画”或多行乱码（例如矩阵被拆成了多行数字），请务必根据上下文将其还原为标准的 LaTeX 公式（如 \\begin{pmatrix}...\\end{pmatrix}）。
+    4. 直接输出译文，不要加任何前缀或解释。
     """
-    
-    if is_caption: sys_prompt += " (注意：这是图片说明，请保留 Figure 编号，例如 '图 1. ...')"
+    if is_caption: sys_prompt += " (这是图注，请保留 Figure 编号)"
     
     try:
         response = client.chat.completions.create(
@@ -161,12 +163,10 @@ def translate_text(text, is_caption=False):
         print(f"Error: {e}")
         return text
 
-# === 修复版：放宽图片抓取阈值 ===
 def capture_image_between_blocks(page, prev_bottom, current_top):
-    # 原来是 40，现在改成 10，防止紧凑的图片被漏掉
+    # 阈值放宽到 10，确保紧凑的图能被抓到
     if current_top - prev_bottom < 10: return None
     
-    # 稍微留一点边距，防止切到文字
     safe_top = prev_bottom + 2
     safe_bottom = current_top - 2
     
@@ -174,10 +174,9 @@ def capture_image_between_blocks(page, prev_bottom, current_top):
 
     rect = fitz.Rect(50, safe_top, page.rect.width - 50, safe_bottom)
     try:
-        # 提高分辨率 matrix=3
         pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=rect, alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
-        # 高度太小可能是分割线，忽略
+        # 只要高度大于 10px 就算有效图
         return img if img.size[1] >= 10 else None
     except: 
         return None
@@ -185,7 +184,6 @@ def capture_image_between_blocks(page, prev_bottom, current_top):
 def batch_translate_elements(elements):
     tasks = []
     indices = []
-    
     for i, el in enumerate(elements):
         if el['type'] in ['text', 'caption']:
             tasks.append((el['content'], el['type'] == 'caption'))
@@ -199,7 +197,6 @@ def batch_translate_elements(elements):
     
     for idx_in_tasks, idx_in_elements in enumerate(indices):
         elements[idx_in_elements]['content'] = results[idx_in_tasks]
-        
     return elements
 
 def parse_page(page):
@@ -207,30 +204,24 @@ def parse_page(page):
     blocks = page.get_text("blocks", sort=True)
     last_bottom = 50 
     text_buffer = ""
-    # 过滤页眉页脚
     valid_blocks = [b for b in blocks if not is_header_or_footer(fitz.Rect(b[:4]), page.rect.height)]
     
     for i, b in enumerate(valid_blocks):
         b_rect = fitz.Rect(b[:4])
         b_top = b_rect.y0
         
-        # 1. 遇到图注 (Figure x...)
+        # 识别图注
         if is_caption_node(b[4]):
-            # 先把缓冲区的文字存下来
             if text_buffer.strip():
                 raw_elements.append({'type': 'text', 'content': text_buffer})
                 text_buffer = ""
             
-            # 2. 尝试抓取图注上方的内容作为图片
-            # (重点：这里去掉了原来过于严格的判定)
+            # 抓取图注上方的图片
             img = capture_image_between_blocks(page, last_bottom, b_top)
-            if img: 
-                raw_elements.append({'type': 'image', 'content': img})
+            if img: raw_elements.append({'type': 'image', 'content': img})
             
-            # 存图注
             raw_elements.append({'type': 'caption', 'content': b[4]})
         else:
-            # 普通文本，累加
             text_buffer += b[4] + "\n\n"
         
         last_bottom = b_rect.y1
@@ -246,10 +237,8 @@ def get_page_image(page):
     return img
 
 def clean_latex(text):
-    # 修复常见的 DeepSeek 输出格式问题
     text = text.replace(r'\[', '$$').replace(r'\]', '$$')
     text = text.replace(r'\(', '$').replace(r'\)', '$')
-    # 有时候 LLM 会输出 ```latex ... ```，去掉它
     text = re.sub(r'```latex', '', text)
     text = re.sub(r'```', '', text)
     return text
@@ -267,7 +256,7 @@ def generate_html(doc, start, end, mode="pure", filename="Document", font_size=1
         html_body += f'<div class="{page_class}">- {page_num} -</div>'
         
         if mode == "screenshot":
-            # 左图右文
+            # 对照模式
             img_b64 = image_to_base64(get_page_image(page))
             html_body += f"""
             <div class="split-layout">
@@ -276,12 +265,10 @@ def generate_html(doc, start, end, mode="pure", filename="Document", font_size=1
             """
             for el in page_els:
                 if el['type'] == 'text':
-                    # 处理文本和公式
                     paras = clean_latex(el['content']).split('\n\n')
                     for p in paras:
                         if p.strip(): html_body += f"<p>{p.strip().replace('**', '')}</p>"
                 elif el['type'] == 'image':
-                    # 这里的 image 是从文本流里扣出来的，放在右侧文字流中
                     html_body += f'<img src="{image_to_base64(el["content"])}" />'
                 elif el['type'] == 'caption':
                     html_body += f'<div class="caption">{clean_latex(el["content"])}</div>'
@@ -327,7 +314,7 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         chrome_bin, "--headless", "--disable-gpu", 
         f"--print-to-pdf={output_pdf_path}",
         "--no-pdf-header-footer", 
-        "--virtual-time-budget=10000", # 增加等待时间给 MathJax 渲染
+        "--virtual-time-budget=8000",
         f"file://{tmp_html_path}"
     ]
     if platform.system() == "Linux": cmd.insert(1, "--no-sandbox")
@@ -339,19 +326,10 @@ def html_to_pdf_with_chrome(html_content, output_pdf_path):
         return False, str(e)
 
 # --- 5. 界面逻辑 ---
-st.title("🔬 光学室学术论文翻译 (V45救命版)")
+st.title("🔬 光学室学术论文翻译 (V46 终极修正版)")
 
 with st.sidebar:
     st.markdown("""
-    <div style="background-color: #ffe6e6; padding: 15px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #ffcccc;">
-        <h4 style="margin:0; color:#cc0000;">🚑 V45 紧急修复</h4>
-        <p style="margin:5px 0 0 0; font-size:12px; color:#555;">
-        1. 修复公式乱码 (LaTeX重构)<br>
-        2. 修复图片抓取丢失问题<br>
-        3. <b>请务必保住猫爪！</b> 🐱
-        </p>
-    </div>
-    
     <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #dcdcdc;">
         <h4 style="margin:0; color:#333;">👤 专属定制</h4>
         <p style="margin:5px 0 0 0; font-size:14px; color:#555;">
@@ -393,7 +371,7 @@ if uploaded_file:
                 st.session_state['run_preview'] = True
         
         if st.session_state.get('run_preview'):
-             with st.spinner("🚀 公式重构 & 图片提取中..."):
+             with st.spinner("🚀 正在修复公式 & 提取图片..."):
                 preview_html = generate_html(doc, page_num, page_num, mode="screenshot", 
                                              font_size=14, line_height=1.5, img_width=50)
                 components.html(preview_html, height=800, scrolling=True)
@@ -414,7 +392,7 @@ if uploaded_file:
             else:
                 bar = st.progress(0)
                 status = st.empty()
-                status.text("正在多核并发翻译 + 公式重构...")
+                status.text("正在多核并发翻译 (含公式重组)...")
                 
                 full_html = generate_html(doc, start, end, mode=style_code, filename=uploaded_file.name,
                                           font_size=ui_font_size, line_height=ui_line_height, img_width=ui_img_width)
@@ -424,8 +402,8 @@ if uploaded_file:
                     ok, msg = html_to_pdf_with_chrome(full_html, tmp_pdf.name)
                     if ok:
                         bar.progress(100)
-                        status.success("✅ 修复完成！猫爪保住了！")
-                        fname = "Translation_V45_Fixed.pdf"
+                        status.success("✅ 修复完成！请查收！")
+                        fname = "Translation_V46_Final.pdf"
                         with open(tmp_pdf.name, "rb") as f:
                             st.download_button("📥 下载文件", f, fname)
                     else:
